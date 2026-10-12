@@ -1,0 +1,19 @@
+{
+  "titre": "Agents",
+  "pieces": [
+    ["local", "Modèle local", "créneaux", "#22c55e"],
+    ["strata", "Second poste · modèle local", "créneaux", "#a855f7"],
+    ["glm", "Cloud · GLM", "créneaux", "#f59e0b"],
+    ["claude", "Claude (abonnement)", "payant", "#ec4899"],
+    ["codex", "Codex / OpenAI", "payant", "#38bdf8"]
+  ],
+  "moteurs_url": {"local": ["llm.example.internal"], "glm": ["z.ai"], "strata": [":8080"]},
+  "moteurs_cmd": {"local": ["mon-fournisseur-local"]},
+  "modeles": {"mon-modele-local": "local", "mon-modele-poste-2": "strata", "glm-5.3-flash": "glm"},
+  "noms_moteurs": {"local": "Modèle local", "strata": "Second poste", "glm": "GLM"},
+  "dossier_cles": "~/.config/mes-agents",
+  "fichiers_cles": {"glm": "glm.key", "strata": "strata.key", "local": "local.key"},
+  "racines_depots": ["~/projets"],
+  "agent_burn": {"binaire": "~/.local/bin/agent-burn", "config": "~/.config/agent-burn/agent-burn.json", "periode": "month"},
+  "classes": {"abonnement": ["glm-"], "payant": ["claude-", "gpt-", "o1", "o3", "o4"]}
+}

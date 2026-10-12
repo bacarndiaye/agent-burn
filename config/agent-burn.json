@@ -1,0 +1,9 @@
+{
+  "defaults": {
+    "pricingOverrides": {
+      "halogen": { "inputCostPerToken": 0, "outputCostPerToken": 0, "cacheCreationInputTokenCost": 0, "cacheReadInputTokenCost": 0 },
+      "swift-1.5-iq3_xxs": { "inputCostPerToken": 0, "outputCostPerToken": 0, "cacheCreationInputTokenCost": 0, "cacheReadInputTokenCost": 0 },
+      "qwen3.8-flash-next-iq3_s": { "inputCostPerToken": 0, "outputCostPerToken": 0, "cacheCreationInputTokenCost": 0, "cacheReadInputTokenCost": 0 }
+    }
+  }
+}

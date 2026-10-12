@@ -1,0 +1,12 @@
+[Unit]
+Description=agent-view serve — vue web de l'atelier d'agents (http://127.0.0.1:8765)
+
+[Service]
+Type=simple
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/usr/bin/python3 %h/.local/bin/agent-view serve 8765
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=default.target
