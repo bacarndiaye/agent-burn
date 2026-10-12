@@ -74,7 +74,7 @@ fn load_entries_inner(
                 .join(", ")
         ),
     );
-    let files = usage_files(&paths, project_filter);
+    let files = prune_files_before_since(usage_files(&paths, project_filter), shared);
     debug_log(shared, format!("Found {} JSONL usage files", files.len()));
     if files.is_empty() {
         return Ok(Vec::new());
@@ -129,6 +129,40 @@ fn load_entries_inner(
         format!("Kept {} usage entries after deduplication", deduped.len()),
     );
     Ok(deduped)
+}
+
+/// Skip transcripts last written before `--since`: an entry dated on or after
+/// `since` cannot live in a file whose last write predates that day. A two-day
+/// margin absorbs timezone grouping. Large Claude histories (thousands of
+/// JSONL files, several GB) otherwise get fully parsed for a one-week view.
+pub(crate) fn prune_files_before_since(files: Vec<PathBuf>, shared: &SharedArgs) -> Vec<PathBuf> {
+    let Some(cutoff) = since_cutoff_unix_seconds(shared.since.as_deref()) else {
+        return files;
+    };
+    files
+        .into_iter()
+        .filter(|file| {
+            fs::metadata(file)
+                .and_then(|metadata| metadata.modified())
+                .ok()
+                .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
+                .is_none_or(|modified| modified.as_secs() as i64 >= cutoff)
+        })
+        .collect()
+}
+
+fn since_cutoff_unix_seconds(since: Option<&str>) -> Option<i64> {
+    let since = since?.replace('-', "");
+    if since.len() != 8 || !since.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let year = since[0..4].parse::<i32>().ok()?;
+    let month = since[4..6].parse::<u32>().ok()?;
+    let day = since[6..8].parse::<u32>().ok()?;
+    if !(1..=12).contains(&month) || day == 0 || day > crate::days_in_month(year, month) {
+        return None;
+    }
+    Some((crate::days_from_civil(year, month, day) - 2) * 86_400)
 }
 
 pub(crate) fn filter_loaded_entries_by_date(entries: &mut Vec<LoadedEntry>, shared: &SharedArgs) {
@@ -565,6 +599,19 @@ fn usage_limit_reset_time_from_line_bytes(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn since_cutoff_keeps_a_two_day_margin_and_rejects_bad_dates() {
+        assert_eq!(super::since_cutoff_unix_seconds(None), None);
+        assert_eq!(super::since_cutoff_unix_seconds(Some("2026-13-01")), None);
+        assert_eq!(super::since_cutoff_unix_seconds(Some("2026020")), None);
+        // 1970-01-03 minus two days = epoch.
+        assert_eq!(super::since_cutoff_unix_seconds(Some("19700103")), Some(0));
+        assert_eq!(
+            super::since_cutoff_unix_seconds(Some("2026-10-12")),
+            super::since_cutoff_unix_seconds(Some("20261012"))
+        );
+    }
+
     use std::{path::Path, sync::Arc};
 
     use super::{

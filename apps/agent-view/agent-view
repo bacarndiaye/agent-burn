@@ -1,0 +1,2786 @@
+#!/usr/bin/env python3
+"""agent-view : vue d'un atelier d'agents de code (manager, superviseurs, développeurs) — terminal et web.
+
+    agent-view                tableau terminal une fois (états + flux des messages)
+    agent-view live [sec]     boucle terminal rafraîchie (défaut 2 s ; Ctrl-C pour sortir)
+    agent-view couts          tokens générés par les moteurs locaux / GLM et équivalent Opus en $ / €
+    agent-view conso          consommation et quotas (agent-burn) : coût par jour gratuit / abonnement / payant,
+                              part gratuite, top modèles, valeur des abonnements, limites 5 h / 7 j
+    agent-view worktrees [--tout]   worktrees jamais poussés / en retard / modifiés (--tout : aussi les à jour)
+    agent-view liens          qui dirige qui, qui attend qui, flux de messages (une fois)
+    agent-view serve [port]   vue web « bureaux & personnages » en 3D animée (défaut 8765) + flux + liens
+                              de communication ; glisser pour tourner, molette pour zoomer, bouton « Vue 2D »
+
+Sources : bus agent-msg (~/.cache/agent-bus : registre, boîtes, fils) ; activité = mtime du transcript
+Claude Code DE L'AGENT (transcript_path du statusline.json de sup-failover, sinon <session>.jsonl repéré par
+--session-id/--resume de son processus claude, sinon le dossier ~/.claude/projects/<worktree>), temps CPU de
+son arbre de processus (un go test long n'est pas une « veille »), écritures récentes dans le worktree.
+Lecture seule, SAUF la page /liens : « réacheminer » / « classer » écrivent dans le bus (POST gardés, journal
+av-actions.log). Le serveur n'écoute que 127.0.0.1 ; toute requête dont l'en-tête Host n'est pas localhost ou
+une IP privée est refusée (anti DNS-rebinding) ; pages servies avec une CSP à nonce.
+Aucune dépendance : python3 standard uniquement (agent-burn, facultatif, alimente la page /conso).
+Configuration locale (non versionnée) : $AV_CONFIG, sinon ~/.config/agent-view/config.json — noms et couleurs
+des salles, repérage des moteurs (URL, modèles), dossier des clés, racines des dépôts ; voir config.example.json.
+"""
+import html
+import json
+import os
+import random
+import re
+import secrets
+import statistics
+import subprocess
+import sys
+import threading
+import time
+from datetime import datetime
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from urllib.parse import parse_qs, urlparse
+
+HOME = Path.home()
+BUS = Path(os.environ.get("AGENT_BUS", HOME / ".cache" / "agent-bus"))
+CLAUDE_PROJ = HOME / ".claude" / "projects"
+SUPCACHE = HOME / ".cache" / "sup-failover"
+
+# ------------------------------------------------------------------ configuration locale --
+# Le dépôt ne porte que des valeurs neutres ; noms de machines, URL internes et noms de modèles maison vivent dans
+# un fichier LOCAL non versionné ($AV_CONFIG, sinon ~/.config/agent-view/config.json). Clés absentes = défaut ci-dessous.
+CONF_DEFAUT = {
+    "titre": "Agents",
+    "pieces": [  # harness -> nom de la salle, capacité affichée, couleur
+        ["local", "Modèle local", "créneaux", "#22c55e"],
+        ["strata", "Second poste · modèle local", "créneaux", "#a855f7"],
+        ["glm", "Cloud · GLM", "créneaux", "#f59e0b"],
+        ["claude", "Claude (abonnement)", "payant", "#ec4899"],
+        ["codex", "Codex / OpenAI", "payant", "#38bdf8"],
+    ],
+    "moteurs_url": {"local": [], "glm": ["z.ai"], "strata": [":8080"]},   # sous-chaîne d'ANTHROPIC_BASE_URL -> moteur
+    "moteurs_cmd": {"local": []},          # sous-chaîne de la ligne de commande (fournisseur Codex) -> moteur
+    "modeles": {},                         # modèle journalisé -> moteur (local, strata, glm)
+    "noms_moteurs": {"local": "Modèle local", "strata": "Second poste", "glm": "GLM"},
+    "dossier_cles": "",                    # dossier des clés qui activent un moteur ; vide = tous les moteurs comptés
+    "fichiers_cles": {},                   # moteur -> nom du fichier de clé dans dossier_cles
+    "racines_depots": ["~/projets"],       # dossiers dont chaque sous-dossier est un dépôt suivi par /worktrees
+    "agent_burn": {"binaire": "~/.local/bin/agent-burn", "config": "", "periode": "month"},
+    "classes": {                           # classe de coût d'un modèle (page /conso)
+        "abonnement": ["glm-"],
+        "payant": ["claude-", "gpt-", "o1", "o3", "o4"],
+    },
+}
+
+
+def charger_conf():
+    chemin = Path(os.environ.get("AV_CONFIG", HOME / ".config" / "agent-view" / "config.json"))
+    conf = json.loads(json.dumps(CONF_DEFAUT))
+    try:
+        local = json.loads(chemin.read_text(encoding="utf8"))
+    except FileNotFoundError:
+        return conf
+    except (OSError, ValueError) as e:
+        print(f"agent-view : configuration ignorée ({chemin}) : {e}", file=sys.stderr)
+        return conf
+    for k, v in local.items():
+        if isinstance(v, dict) and isinstance(conf.get(k), dict):
+            conf[k].update(v)
+        else:
+            conf[k] = v
+    return conf
+
+
+CONF = charger_conf()
+PIECES = [tuple(p) for p in CONF["pieces"]]
+ACTION_S = 90        # activité < 90 s = en action
+CPU_ACTIF = float(os.environ.get("AV_CPU_ACTIF", "0.15"))   # arbre de l'agent à ≥ 15 % d'un cœur entre 2 collectes = en action
+JUNIOR = {h for h in os.environ.get("AV_JUNIOR", "local,strata").split(",") if h}   # moteurs légers = « dev junior »
+AVATAR = {"sup": "🧑‍💼", "dev": "🧑‍💻", "mgr": "🧑‍✈️"}
+
+
+def parse_when(s):
+    try:
+        return datetime.strptime(s, "%Y%m%dT%H%M%S").timestamp()
+    except Exception:
+        return None
+
+
+def transcript_dir(worktree):
+    """Dossier des transcripts Claude Code d'un cwd : tout caractère hors [A-Za-z0-9-] devient « - »
+    (…/projet/.claude/worktrees/x -> -home-…-projet--claude-worktrees-x)."""
+    return CLAUDE_PROJ / re.sub(r"[^A-Za-z0-9-]", "-", str(worktree))
+
+
+CTRL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")
+
+
+def pur(s):
+    """Texte venu du bus ou d'un nom de dossier, sans caractères de contrôle (séquences ESC/OSC en terminal)."""
+    return CTRL.sub("", str(s if s is not None else ""))
+
+
+def lire(f, limite=None):
+    """read_text tolérant (UTF-8 invalide remplacé) ; limite = octets lus au plus."""
+    with open(f, encoding="utf8", errors="replace") as fh:
+        return fh.read(limite) if limite else fh.read()
+
+
+def newest_mtime(paths, limit=12, needle=None):
+    """mtime du fichier le plus récent parmi les `limit` plus récents de chaque entrée.
+
+    needle : si plusieurs agents vivants partagent le même dossier de transcripts, le
+    mtime max du dossier est ambigu (il reflète l'ACTIVITÉ D'UN AUTRE). On cherche alors
+    l'id de l'agent DANS les jsonl récents (le prompt d'agent-msg porte l'identité) et on
+    prend le plus récent qui matche."""
+    best = 0.0
+    for p in paths:
+        try:
+            if p.is_file():
+                best = max(best, p.stat().st_mtime)
+            elif p.is_dir():
+                files = sorted(p.iterdir(), key=lambda x: x.stat().st_mtime if x.is_file() else 0, reverse=True)
+                if needle:
+                    for f in files[:limit]:
+                        try:
+                            if f.is_file() and needle in _tete_queue(f):
+                                best = max(best, f.stat().st_mtime)
+                                break
+                        except OSError:
+                            pass
+                    continue
+                for f in files[:limit]:
+                    try:
+                        best = max(best, f.stat().st_mtime)
+                    except OSError:
+                        pass
+        except OSError:
+            pass
+    return best
+
+
+def _tete_queue(f, n=65536):
+    """Début et fin d'un jsonl (l'identité de l'agent est dans le 1er prompt et dans les messages récents)."""
+    with open(f, "rb") as fh:
+        tete = fh.read(n)
+        try:
+            fh.seek(-n, os.SEEK_END)
+        except OSError:
+            return tete.decode("utf8", "replace")
+        return (tete + fh.read()).decode("utf8", "replace")
+
+
+def sup_transcript(pid):
+    """transcript_path du statusline.json de sup-failover pour ce pid (superviseurs Claude Code)."""
+    if SUPCACHE.is_dir():
+        for d in SUPCACHE.iterdir():
+            if d.is_dir() and d.name.endswith(f"-{pid}"):
+                f = d / "statusline.json"
+                if f.is_file():
+                    try:
+                        return json.loads(lire(f)).get("transcript_path")
+                    except Exception:
+                        return None
+    return None
+
+
+def worktree_recent(worktree):
+    """une écriture < 2 min dans le worktree ? (find -quit, plafonné à 2 s)"""
+    try:
+        if not worktree or not os.path.isdir(worktree):
+            return False
+        r = subprocess.run(["find", str(worktree), "(", "-name", ".git", "-o", "-path", "*/.claude/worktrees", "-o",
+                            "-name", "node_modules", ")", "-prune", "-o", "-type", "f", "-mmin", "-2", "-print", "-quit"],
+                           capture_output=True, timeout=2)
+        return r.returncode == 0 and r.stdout.strip() != b""
+    except Exception:
+        return False
+
+
+def pid_start(pid):
+    """Champ 22 de /proc/<pid>/stat (démarrage, en tops d'horloge depuis le boot) ou None."""
+    try:
+        st = open(f"/proc/{int(pid)}/stat").read()
+        return int(st[st.rindex(")") + 2:].split()[19])
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+START_KEYS = ("pid_start", "pidstart", "start_ticks", "starttime", "pid_starttime", "start")
+
+
+def alive(pid, start=None):
+    """pid vivant ; si le registre donne l'heure de démarrage du pid, elle doit correspondre (pid réutilisé = fini)."""
+    if not pid:
+        return False
+    try:
+        os.kill(int(pid), 0)
+    except (ValueError, ProcessLookupError):
+        return False
+    except PermissionError:
+        pass
+    try:
+        st = open(f"/proc/{int(pid)}/stat").read()
+        if st[st.rindex(")") + 2:].split()[0] == "Z":
+            return False                     # zombie : le processus est mort, seul son parent ne l'a pas récolté
+    except (OSError, ValueError, IndexError):
+        pass
+    if start and str(start).isdigit():
+        reel = pid_start(pid)
+        if reel is not None and reel != int(start):
+            return False
+    return True
+
+
+def reg_alive(reg):
+    return alive(reg.get("pid", ""), next((reg[k] for k in START_KEYS if reg.get(k)), None))
+
+
+# ------------------------------------------- moteur réel et créneaux (dev-agent / engine-check) --
+
+DEVLOCKS = HOME / ".cache" / "dev-agent"
+CRENEAUX = {      # moteur -> (préfixe du fichier verrou, nombre de créneaux) : mêmes valeurs que engine-check
+    "glm": ("slot-glm-", int(os.environ.get("DEV_AGENT_GLM_SLOTS", "5"))),
+    "strata": ("slot-strata-", int(os.environ.get("DEV_AGENT_STRATA_SLOTS", "4"))),
+    "local": ("slot-", int(os.environ.get("DEV_AGENT_LOCAL_SLOTS", "1"))),
+}
+CLES = CONF["fichiers_cles"]       # moteur -> fichier de clé qui l'active (configuration locale)
+DOSSIER_CLES = Path(os.path.expanduser(CONF["dossier_cles"])) if CONF["dossier_cles"] else None
+_PROC_CACHE = {"t": 0.0, "v": {}, "cpu": {}, "ppid": {}}
+_CRENEAUX_CACHE = {"t": 0.0, "v": {}}
+_CPU_PREV = {}            # pid enregistré -> (instant, tops CPU de son arbre) : activité CPU entre deux collectes
+AGENT_BIN = re.compile(r"(^|/)(claude|codex)$")
+SOUS_CMD_AUX = {"mcp", "update", "doctor", "config", "install", "migrate-installer", "setup-token", "plugin", "app-server",
+                "mcp-server", "login", "logout", "completion", "proto"}
+AUX_BIN = re.compile(r"(^|/)(bg-pty-host|bg-spare|code-mode-host|app-server|mcp-server)$|daemon$")
+try:
+    CLK = os.sysconf("SC_CLK_TCK")
+    BOOT = next(int(l.split()[1]) for l in open("/proc/stat") if l.startswith("btime "))
+except (OSError, ValueError, StopIteration):
+    CLK, BOOT = 100, 0
+
+
+def auxiliaire(argv):
+    """Processus claude/codex qui n'est pas un agent : sous-commande utilitaire, --version, hôtes et démons."""
+    if any(AUX_BIN.search(x) for x in argv[:2]):
+        return True
+    pos = [x for x in argv[1:] if not x.startswith("-")]
+    return (bool(pos) and pos[0] in SOUS_CMD_AUX and argv[1] == pos[0]) or (len(argv) == 2 and argv[1] in ("--version", "-v"))
+
+
+def rollouts_ouverts(pid):
+    """Rollouts Codex tenus ouverts par le processus (Codex garde son journal de session ouvert)."""
+    out = []
+    try:
+        for fd in os.listdir(f"/proc/{pid}/fd"):
+            try:
+                cible = os.readlink(f"/proc/{pid}/fd/{fd}")
+            except OSError:
+                continue
+            if "/.codex/sessions/" in cible and cible.endswith(".jsonl"):
+                out.append(cible)
+    except OSError:
+        pass
+    return out
+
+
+def session_de(argv):
+    """Identifiant de session Claude Code passé en ligne de commande (--session-id / --resume / -r)."""
+    for i, x in enumerate(argv[:-1]):
+        if x in ("--session-id", "--resume", "-r") and re.fullmatch(r"[0-9a-f-]{36}", argv[i + 1]):
+            return argv[i + 1]
+    return None
+WT_SEP = "/.claude/worktrees/"
+
+
+MODELES_MOTEUR = {k.lower(): v for k, v in CONF["modeles"].items()}
+
+
+def moteur_cmd(cmd):
+    """Moteur repéré dans la ligne de commande (ex. fournisseur Codex d'un modèle local), sinon None."""
+    for moteur, motifs in CONF["moteurs_cmd"].items():
+        if any(x and x in cmd for x in motifs):
+            return moteur
+    return None
+
+
+def _moteur_url(base, modele):
+    """Moteur déduit de l'endpoint Anthropic-compatible d'un processus claude (ou None : abonnement)."""
+    b, m = (base or "").lower(), (modele or "").lower()
+    if m in MODELES_MOTEUR:
+        return MODELES_MOTEUR[m]
+    for moteur, motifs in CONF["moteurs_url"].items():
+        if any(x and x.lower() in b for x in motifs):
+            return moteur
+    if m.startswith("glm"):
+        return "glm"
+    return None
+
+
+def processus_agents():
+    """{pid: infos} des processus claude / codex (hors auxiliaires) : ppid, cwd, démarrage, AGENT_ID, moteur.
+    Une seule lecture de /proc toutes les 6 s ; les shells et serveurs MCP ne sont pas lus."""
+    now = time.time()
+    if now - _PROC_CACHE["t"] < 6:
+        return _PROC_CACHE["v"]
+    procs, tous, cpu = {}, {}, {}
+    try:
+        pids = [int(d) for d in os.listdir("/proc") if d.isdigit()]
+    except OSError:
+        pids = []
+    for p in pids:
+        try:
+            st = open(f"/proc/{p}/stat").read()
+            champs = st[st.rindex(")") + 2:].split()
+            tous[p] = int(champs[1])
+            cpu[p] = int(champs[11]) + int(champs[12])          # utime + stime
+            debut = BOOT + int(champs[19]) / CLK
+            argv = [x.decode("utf8", "replace") for x in open(f"/proc/{p}/cmdline", "rb").read().split(b"\0") if x]
+        except (OSError, ValueError, IndexError):
+            continue
+        if not argv:
+            continue
+        tete = [x for x in argv[:2] if not x.startswith("-")]
+        if not any(AGENT_BIN.search(x) for x in tete) or auxiliaire(argv):
+            continue
+        try:
+            cwd = os.readlink(f"/proc/{p}/cwd")
+            raw = open(f"/proc/{p}/environ", "rb").read()
+            t = debut
+        except OSError:
+            continue
+        env = {}
+        for kv in raw.split(b"\0"):
+            k, _, v = kv.partition(b"=")
+            if k in (b"AGENT_ID", b"ANTHROPIC_BASE_URL", b"ANTHROPIC_MODEL"):
+                env[k.decode()] = v.decode("utf8", "replace")
+        cmd = " ".join(argv)
+        m = _moteur_url(env.get("ANTHROPIC_BASE_URL"), env.get("ANTHROPIC_MODEL"))
+        if m is None:
+            m = moteur_cmd(cmd) or ("codex" if any("codex" in x for x in tete) else "claude")
+        procs[p] = {"pid": p, "ppid": tous[p], "cwd": cwd, "start": t, "agent_id": env.get("AGENT_ID", ""),
+                    "moteur": m, "declare": bool(env.get("ANTHROPIC_BASE_URL")) or bool(moteur_cmd(cmd)), "cmd": cmd[:160],
+                    "sid": session_de(argv), "rollouts": rollouts_ouverts(p) if m == "codex" else []}
+    for p, d in procs.items():
+        d["ppids"] = []                       # ascendance (pid vers la racine), pour rattacher un processus à un agent enregistré
+        q, n = d["ppid"], 0
+        while q > 1 and n < 12:
+            d["ppids"].append(q)
+            q, n = tous.get(q, 0), n + 1
+    _PROC_CACHE.update(t=now, v=procs, cpu=cpu, ppid=tous)
+    return procs
+
+
+def cpu_par_agent(regpids):
+    """{pid enregistré: tops CPU de son arbre}, chaque processus compté pour l'agent enregistré le plus PROCHE
+    (un superviseur n'hérite pas du CPU de ses développeurs, qui ont leur propre inscription)."""
+    tous, cpu, out = _PROC_CACHE["ppid"], _PROC_CACHE["cpu"], {}
+    for p, c in cpu.items():
+        q, n = p, 0
+        while q > 1 and n < 16:
+            if q in regpids:
+                out[q] = out.get(q, 0) + c
+                break
+            q, n = tous.get(q, 0), n + 1
+    return out
+
+
+def jsonl_de(procs, agent_id, regpid):
+    """Transcript de l'agent d'après la session de SON processus claude (descendant du pid enregistré, sinon
+    processus portant son AGENT_ID) : <dossier du cwd>/<session>.jsonl. None si inconnu."""
+    try:
+        rp = int(regpid)
+    except (TypeError, ValueError):
+        rp = 0
+    cand = [d for d in procs.values() if d.get("sid") and (rp in d["ppids"] or d["pid"] == rp or d["agent_id"] == agent_id)]
+    cand.sort(key=lambda d: (d["ppids"].index(rp) if rp in d["ppids"] else 99, -d["start"]))
+    for d in cand:
+        f = transcript_dir(d["cwd"]) / f"{d['sid']}.jsonl"
+        if f.is_file():
+            return f
+    codex = [d for d in procs.values() if d["rollouts"] and (rp in d["ppids"] or d["pid"] == rp or d["agent_id"] == agent_id)]
+    fichiers = [Path(r) for d in codex for r in d["rollouts"]]
+    return max(fichiers, key=lambda f: f.stat().st_mtime if f.exists() else 0) if fichiers else None
+
+
+def moteur_reel(procs, agent_id, regpid):
+    """Moteur d'un agent d'après SON processus claude : le fils direct du pid enregistré (le superviseur basculé de GLM sur
+    modèle local reste « glm » dans le bus), sinon le descendant le plus proche, sinon le plus récent portant son AGENT_ID.
+    Un `claude -p` lancé à la main par un superviseur hérite de son AGENT_ID mais ne le définit pas."""
+    cand = [d for d in procs.values() if d["agent_id"] == agent_id and d["declare"]]
+    if not cand:
+        return None
+    try:
+        rp = int(regpid)
+    except (TypeError, ValueError):
+        rp = 0
+
+    def rang(d):
+        prof = d["ppids"].index(rp) if rp in d["ppids"] else 99
+        return (prof, -d["start"])
+    return min(cand, key=rang)["moteur"]
+
+
+def hors_bus(procs, regs):
+    """Développeurs/agents lancés sans passer par dev-agent : processus claude/codex dans un worktree qu'aucun agent
+    enregistré vivant ne couvre. Un enregistrement synthétique par worktree (id « hors-bus-<worktree> »)."""
+    def racine(wt):
+        return wt.split(WT_SEP, 1)[0] + WT_SEP + wt.split(WT_SEP, 1)[1].split("/")[0] if WT_SEP in wt else None
+    couverts, pids_reg = set(), set()
+    for r in regs:
+        if reg_alive(r):
+            if racine(r.get("worktree", "")):
+                couverts.add(racine(r["worktree"]))
+            if str(r.get("pid", "")).isdigit():
+                pids_reg.add(int(r["pid"]))
+    par_wt = {}
+    for d in procs.values():
+        rac = racine(d["cwd"])
+        if not rac or rac in couverts or d["pid"] in pids_reg or pids_reg & set(d["ppids"]):
+            continue
+        if rac not in par_wt or d["start"] < par_wt[rac]["start"]:
+            par_wt[rac] = d                    # le plus ancien = le processus principal
+    out = []
+    ids = {r["__id"]: r for r in regs}
+    for rac, d in sorted(par_wt.items()):
+        pere = d["agent_id"] if d["agent_id"] in ids else ""
+        out.append({"__id": "hors-bus-" + os.path.basename(rac), "role": "dev", "harness": d["moteur"], "worktree": rac,
+                    "parent": pere, "pid": str(d["pid"]), "since": time.strftime("%Y%m%dT%H%M%S", time.localtime(d["start"])),
+                    "__hors_bus": True})
+    return out
+
+
+def creneaux():
+    """{moteur: {total, pris, libres}} : verrous flock tenus par les dev-agent. /proc/locks ne montre pas les verrous
+    dont le détenteur est hors de l'espace de noms (pid 0) : on lit les fdinfo des seuls dev-agent, sans rien verrouiller.
+    Total = DEV_AGENT_<MOTEUR>_SLOTS (même source que dev-agent / engine-check), relevé au nombre de verrous tenus si
+    un superviseur a lancé ses développeurs avec une valeur plus haute. Mis en cache 6 s."""
+    if time.time() - _CRENEAUX_CACHE["t"] < 6:
+        return _CRENEAUX_CACHE["v"]
+    pris_inodes = set()
+    try:
+        pids = [d for d in os.listdir("/proc") if d.isdigit()]
+    except OSError:
+        pids = []
+    for p in pids:
+        try:
+            if b"dev-agent" not in open(f"/proc/{p}/cmdline", "rb").read():
+                continue
+            fds = os.listdir(f"/proc/{p}/fdinfo")
+        except OSError:
+            continue
+        for fd in fds:
+            try:
+                txt = open(f"/proc/{p}/fdinfo/{fd}").read()
+            except OSError:
+                continue
+            if "\nlock:" in txt and "FLOCK" in txt:
+                m = re.search(r"^ino:\s+(\d+)", txt, re.M)
+                if m:
+                    pris_inodes.add(int(m.group(1)))
+    out = {}
+    if not DEVLOCKS.is_dir():        # poste sans dev-agent : pas de créneaux à afficher
+        return out
+    for m, (pre, n) in CRENEAUX.items():
+        if DOSSIER_CLES and m in CLES and not (DOSSIER_CLES / CLES[m]).exists():
+            continue                       # moteur non configuré sur ce poste : rien à compter
+        pris = 0
+        for i in range(1, max(n, 8) + 1):
+            try:
+                if (DEVLOCKS / f"{pre}{i}.lock").stat().st_ino in pris_inodes:
+                    pris += 1
+            except OSError:
+                pass
+        total = max(n, pris)
+        out[m] = {"total": total, "pris": pris, "libres": total - pris}
+    _CRENEAUX_CACHE.update(t=time.time(), v=out)
+    return out
+
+
+def collect():
+    now = time.time()
+    procs = processus_agents()
+    agents = []
+    regs = []
+    regs += registre_agents()
+    regs += hors_bus(procs, regs)
+    # cwd partagés par plusieurs vivants → activité désambiguïsée par l'id dans le transcript
+    vivants = {r["__id"]: reg_alive(r) for r in regs}
+    partage = {}
+    for reg in regs:
+        if vivants[reg["__id"]]:
+            d = str(transcript_dir(reg.get("worktree", "")))
+            partage[d] = partage.get(d, 0) + 1
+    regpids = {int(r["pid"]) for r in regs if vivants[r["__id"]] and str(r.get("pid", "")).isdigit()}
+    cpu = cpu_par_agent(regpids)
+    for reg in regs:
+        f_id = reg["__id"]
+        pid = reg.get("pid", "")
+        wt = reg.get("worktree", "")
+        is_alive = vivants[f_id]
+        act, cpu_actif = 0.0, False
+        if is_alive:                       # un agent fini n'est plus observé : aucune lecture de transcript
+            tp = sup_transcript(pid)
+            propre = Path(tp) if tp else jsonl_de(procs, f_id, pid)
+            if propre is not None:
+                act = newest_mtime([propre])
+            else:
+                td = transcript_dir(wt)
+                needle = f_id if partage.get(str(td), 0) > 1 else None
+                act = newest_mtime([td] if td.is_dir() else [], needle=needle)
+            if pid.isdigit() and int(pid) in cpu:
+                t_prev, c_prev = _CPU_PREV.get(int(pid), (None, None))
+                if t_prev and now > t_prev:
+                    cpu_actif = (cpu[int(pid)] - c_prev) / CLK / (now - t_prev) >= CPU_ACTIF
+                _CPU_PREV[int(pid)] = (now, cpu[int(pid)])
+        if is_alive and (now - act < ACTION_S or cpu_actif or worktree_recent(wt)):
+            state = "action"
+        elif is_alive:
+            state = "veille"
+        else:
+            state = "fini"
+        decl = reg.get("harness", "?")
+        harness = (moteur_reel(procs, f_id, pid) or decl) if is_alive and not reg.get("__hors_bus") else decl
+        agents.append({
+            "id": f_id, "role": reg.get("role", "?"), "harness": harness, "harness_declare": decl, "hors_bus": bool(reg.get("__hors_bus")),
+            "worktree": wt, "parent": reg.get("parent", ""), "pid": int(pid) if pid.isdigit() else 0,
+            "classe": "mgr" if reg.get("role") == "mgr" else "sup" if reg.get("role") == "sup" else "junior" if harness in JUNIOR else "dev",
+            "since": reg.get("since", ""), "alive": is_alive, "state": state,
+            "activity_ago": max(0, int(now - act)) if act else None,
+            "wt_short": os.path.basename(wt.rstrip("/")) or wt,
+        })
+    # messages : toutes les boîtes (non lus + lus) ; stat de tout, lecture des 40 plus récents seulement
+    datés = []
+    if (BUS / "inbox").is_dir():
+        for f in list((BUS / "inbox").glob("*/*.msg")) + list((BUS / "inbox").glob("*/lu/*.msg")):
+            try:
+                datés.append((f.stat().st_mtime, f))
+            except OSError:
+                continue
+    datés.sort(key=lambda x: x[0], reverse=True)
+    msgs = []
+    for mtime, f in datés[:40]:
+        try:
+            head = lire(f, 4000).split("\n\n", 1)
+            fields = dict(l.split("=", 1) for l in head[0].splitlines() if "=" in l)
+            msgs.append({"from": fields.get("de", "?"), "to": fields.get("à", "?"),
+                         "when": fields.get("quand", ""), "text": (head[1] if len(head) > 1 else "").strip(),
+                         "path": str(f), "mtime": mtime, "read": f.parent.name == "lu", "ago": int(now - mtime)})
+        except (OSError, ValueError):
+            continue
+    threads = []
+    if (BUS / "threads").is_dir():
+        fils = []
+        for f in (BUS / "threads").glob("*.md"):
+            try:
+                fils.append((f.stat().st_mtime, f))
+            except OSError:
+                continue
+        for _, f in sorted(fils, key=lambda x: x[0], reverse=True):
+            try:
+                lines = lire(f).splitlines()
+                last = next((l for l in reversed(lines) if l.strip() and not l.startswith("### ")), "")
+                threads.append({"name": f.stem, "ago": int(now - f.stat().st_mtime), "last": last[:120]})
+            except OSError:
+                continue
+    return {"now": int(now), "agents": agents, "messages": msgs, "threads": threads, "slots": creneaux()}
+
+
+# ---------------------------------------------------------------- terminal --
+
+C = {"action": "\033[32m", "veille": "\033[33m", "fini": "\033[90m", "b": "\033[1m", "d": "\033[2m", "0": "\033[0m"}
+DOT = {"action": "●", "veille": "◐", "fini": "·"}
+
+
+def ago_txt(s):
+    if s is None:
+        return "—"
+    if s < 60:
+        return f"{s}s"
+    if s < 3600:
+        return f"{s // 60}m{'' if s % 60 == 0 else str(s % 60).rjust(2, '0') + 's'}"
+    return f"{s // 3600}h{(s % 3600) // 60:02d}"
+
+
+def render_text(st):
+    a = st["agents"]
+    n_act = sum(1 for x in a if x["state"] == "action")
+    n_vei = sum(1 for x in a if x["state"] == "veille")
+    n_fin = sum(1 for x in a if x["state"] == "fini")
+    out = [f"{C['b']}AGENTS — {datetime.now():%H:%M:%S}{C['0']}  {C['d']}·{C['0']} "
+           f"{C['action']}{n_act} en action{C['0']}, {C['veille']}{n_vei} en veille{C['0']}, {n_fin} finis",
+           f"{'ÉTAT':^4} {'AGENT':34} {'RÔLE':5} {'MOTEUR':7} {'ACTIVITÉ':9} WORKTREE"]
+    sl = st.get("slots") or {}
+    if sl:
+        out.insert(1, f"{C['d']}créneaux dev : " + " · ".join(
+            f"{m} {v['pris']}/{v['total']} pris" + (f" {C['veille']}(tous libres){C['d']}" if v["pris"] == 0 else "")
+            for m, v in sl.items()) + C["0"])
+    finis = []
+    for x in sorted(a, key=lambda v: ({"action": 0, "veille": 1, "fini": 2}[v["state"]], v["id"])):
+        mark = f"{C[x['state']]}{DOT[x['state']]}{C['0']}"
+        moi = "  ← moi" if os.environ.get("AGENT_ID") == x["id"] else ""
+        out.append(f"{mark:^4} {('⚠ ' if x.get('hors_bus') else '') + pur(x['id']):34} {pur(x['role']):5} {pur(x['harness']):7} "
+                   f"{ago_txt(x['activity_ago']):>9} {pur(x['wt_short'])}{moi}")
+        if x["state"] == "fini":
+            finis.append(x)
+    if len(finis) > 8:
+        coupe = len(finis) - 8
+        out = out[:-coupe]
+        out.append(f"{C['d']}… et {coupe} agents finis plus anciens (machine à jour : le bus ne garde que l'état courant){C['0']}")
+    out.append("")
+    out.append(f"{C['b']}FLUX — derniers messages{C['0']}")
+    for m in st["messages"][:15]:
+        first = pur((m["text"] or "").splitlines()[0][:70]) if m["text"] else "(vide)"
+        lu = "" if m["read"] else f" {C['b']}*(non lu){C['0']}"
+        out.append(f"{C['d']}{ago_txt(m['ago']):>5}{C['0']}  {pur(m['from'])} → {pur(m['to'])}: {first}{lu}")
+    for t in st["threads"][:5]:
+        out.append(f"{C['d']}{ago_txt(t['ago']):>5}{C['0']}  fil {pur(t['name'])}: {pur(t['last'])}")
+    if st.get("erreur"):
+        out.append(f"{C['veille']}⚠ {pur(st['erreur'])}{C['0']}")
+    return "\n".join(out)
+
+
+# ------------------------------------------------------------------- web --
+
+PAGE = r"""<!doctype html>
+<html lang="fr"><head><meta charset="utf-8">
+<title>__TITRE__ — bureaux</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+:root{--bg:#0f1117;--piece:#171a23;--desk:#1d2230;--txt:#d7dae2;--dim:#7a8090;
+ --act:#22c55e;--vei:#eab308;--fin:#4b5162}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--txt);
+ font:14px/1.45 ui-sans-serif,system-ui,sans-serif}
+header{display:flex;justify-content:space-between;align-items:baseline;padding:14px 22px;border-bottom:1px solid #232838}
+header h1{font-size:17px;margin:0}#counts{color:var(--dim);font-size:13px}
+#layout{display:grid;grid-template-columns:1fr 340px;gap:18px;padding:18px 22px;align-items:start}
+#bureaux{display:flex;flex-direction:column;gap:16px}
+.piece{background:var(--piece);border:1px solid #232838;border-radius:14px;padding:14px 16px}
+.piece h2{margin:0 0 10px;font-size:13px;letter-spacing:.4px;display:flex;gap:10px;align-items:center}
+.piece h2 .cap{color:var(--dim);font-weight:400;font-size:12px}
+.swatch{width:9px;height:9px;border-radius:50%;display:inline-block}
+.desks{display:flex;flex-wrap:wrap;gap:14px}
+.desk{background:var(--desk);border:1px solid #262c3d;border-radius:10px;padding:10px 12px 8px;
+ min-width:170px;max-width:230px;position:relative;transition:box-shadow .3s}
+.desk .pers{font-size:30px;line-height:1;display:block;text-align:center;position:relative}
+.desk.action{box-shadow:0 0 0 2px var(--act),0 0 18px -4px var(--act)}
+.desk.action .pers{animation:bounce 1.1s infinite}
+.desk.veille{opacity:.85}.desk.veille .pers:after{content:"😴";position:absolute;font-size:14px;right:-2px;bottom:-4px}
+.desk.fini{opacity:.42;filter:grayscale(.7)}
+.desk .nom{display:block;text-align:center;font-size:12px;margin-top:6px;font-family:ui-monospace,monospace;
+ white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.desk .meta{display:flex;justify-content:space-between;font-size:11px;color:var(--dim);margin-top:2px}
+.desk .wt{position:absolute;top:-9px;left:50%;transform:translateX(-50%);background:#232838;color:var(--txt);
+ font-size:10px;padding:1px 8px;border-radius:8px;max-width:92%;white-space:nowrap;overflow:hidden;
+ text-overflow:ellipsis;font-family:ui-monospace,monospace}
+svg#liens{position:fixed;inset:0;pointer-events:none;z-index:5}
+svg#liens line{stroke:#f59e0b;stroke-width:1.6;stroke-dasharray:7 5;animation:flow 1s linear infinite;opacity:.75}
+@keyframes flow{to{stroke-dashoffset:-12}}
+@keyframes bounce{0%,100%{transform:translateY(0)}30%{transform:translateY(-4px)}}
+#side{position:sticky;top:14px;display:flex;flex-direction:column;gap:14px}
+.panel{background:var(--piece);border:1px solid #232838;border-radius:14px;padding:12px 14px}
+.panel h3{margin:0 0 8px;font-size:13px}
+.panel ul{list-style:none;margin:0;padding:0;max-height:46vh;overflow-y:auto}
+.panel li{padding:5px 0;border-bottom:1px solid #1f2433;font-size:12.5px}
+.panel li .route{font-family:ui-monospace,monospace;font-size:11.5px;color:#9aa2b5}
+.panel li .t{color:var(--dim);font-size:11px;margin-left:6px}
+.panel li .txt{display:block;color:#b9bfcf;margin-top:2px}
+#refresh{color:var(--dim);font-size:12px}
+@media(max-width:1100px){#layout{grid-template-columns:1fr}#side{position:static}}
+/* ---- vue 3D (CSS 3D pur) ---- */
+#left{min-width:0}
+#bar{display:flex;gap:8px;align-items:center;margin-bottom:10px;flex-wrap:wrap}
+#bar button{background:var(--piece);color:var(--txt);border:1px solid #2c3347;border-radius:8px;padding:5px 11px;
+ font:inherit;font-size:12.5px;cursor:pointer}
+#bar button:hover{border-color:#4a5372}#bar button.on{border-color:var(--act);color:var(--act)}
+#bar .hint{color:var(--dim);font-size:12px;margin-left:auto}
+body.m2d #stage,body.m2d .only3d{display:none}body.m3d #bureaux{display:none}
+#stage{position:relative;height:calc(100vh - 150px);min-height:520px;border:1px solid #232838;border-radius:14px;
+ overflow:hidden;perspective:2400px;perspective-origin:50% 36%;cursor:grab;touch-action:none;user-select:none;
+ background:radial-gradient(ellipse at 50% 28%,#1c2132 0%,#10131b 58%,#0a0c12 100%)}
+#stage.drag{cursor:grabbing}
+#world{position:absolute;left:50%;top:50%;width:0;height:0;transform-style:preserve-3d;will-change:transform}
+.room{position:absolute;transform-style:preserve-3d}
+.floor{position:absolute;inset:0;border-radius:12px;border:2px solid color-mix(in srgb,var(--rc) 60%,#0f121a);
+ background:linear-gradient(#ffffff0a 1px,transparent 1px) 0 0/50px 50px,linear-gradient(90deg,#ffffff0a 1px,transparent 1px) 0 0/50px 50px,
+ color-mix(in srgb,var(--rc) 9%,#12151f);box-shadow:0 0 46px -10px color-mix(in srgb,var(--rc) 45%,transparent)}
+.wall{position:absolute;left:0;top:0;width:100%;height:58px;transform-origin:0 0;transform:rotateX(90deg);border-radius:10px 10px 0 0;
+ background:linear-gradient(0deg,color-mix(in srgb,var(--rc) 30%,#1a1f2d),#141824);border:1px solid color-mix(in srgb,var(--rc) 50%,#0f121a)}
+.rtitle{position:absolute;left:20px;top:-30px;height:30px;transform-origin:0 100%;white-space:nowrap;
+ font:700 17px/30px ui-sans-serif,system-ui,sans-serif;color:var(--rc);text-shadow:0 0 14px color-mix(in srgb,var(--rc) 60%,transparent),0 1px 3px #000;
+ transform:translateZ(122px)}
+.rtitle small{font-weight:400;font-size:12px;color:var(--dim);margin-left:8px}
+#stage[data-lod=far] .fini .bb,#stage[data-lod=far] .bb .st{display:none}
+#stage[data-lod=mid] .fini .bb .st{display:none}
+.desk3d{position:absolute;width:0;height:0;transform-style:preserve-3d;
+ --torso:var(--pc);--skin:var(--sk);--hair:var(--hr);--deskc:#2d3449}
+.desk3d.fini{--torso:#3a3f4e;--skin:#5b6272;--hair:#2e333f;--deskc:#222734}
+.desk3d i,.desk3d .pad{display:block}
+.bx{position:absolute;transform-style:preserve-3d}
+.bx>i{position:absolute;transform-origin:0 0;background:var(--c)}
+.bx>i.t{left:0;top:0;width:100%;height:100%}
+.bx>i.fr,.bx>i.bk{left:0;transform:rotateX(90deg)}.bx>i.bk{top:0}
+.bx>i.lf,.bx>i.rt{top:0;transform:rotateY(-90deg)}.bx>i.lf{left:0}
+.bx>i.fr{background:linear-gradient(#00000030,#00000030),var(--c)}
+.bx>i.bk{background:linear-gradient(#00000055,#00000055),var(--c)}
+.bx>i.lf{background:linear-gradient(#00000040,#00000040),var(--c)}
+.bx>i.rt{background:linear-gradient(#00000070,#00000070),var(--c)}
+.pad{position:absolute;left:-66px;top:-42px;width:132px;height:118px;border-radius:14px;transform:translateZ(.7px);
+ border:1px solid #ffffff10;background:#ffffff05}
+.action .pad{border-color:var(--act);background:#22c55e1f;box-shadow:0 0 28px #22c55e70;animation:glow 1.6s ease-in-out infinite alternate}
+.veille .pad{border-color:#eab30899;background:#eab3080f}
+.me .pad{border:2px dashed #cfd5e6}
+@keyframes glow{from{opacity:.5}to{opacity:1}}
+.scr{position:absolute;left:-23px;top:-16.6px;width:46px;height:24px;transform:translateZ(38px) rotateX(90deg);
+ transform-origin:0 0;background:#0a0c12}
+.action .scr{background:repeating-linear-gradient(0deg,#22c55e 0 2px,#06310f 2px 6px);animation:code .7s linear infinite}
+.veille .scr{background:linear-gradient(#4a4210,#241f08)}
+@keyframes code{to{background-position:0 -12px}}
+.kb{position:absolute;left:-17px;top:-2px;width:34px;height:12px;transform:translateZ(30.7px);border-radius:2px;
+ background:repeating-linear-gradient(90deg,#3b4258 0 3px,#1b2030 3px 5px)}
+.arm,.head{position:absolute;left:0;top:0;width:0;height:0;transform-style:preserve-3d}
+.head{transform-origin:0 43px 50px}
+.action .arm.l{animation:key .2s ease-in-out infinite alternate}
+.action .arm.r{animation:key .2s .1s ease-in-out infinite alternate}
+@keyframes key{from{transform:translateZ(0)}to{transform:translateZ(3.5px)}}
+.action .head{animation:nod 1.8s ease-in-out infinite}
+@keyframes nod{0%,100%{transform:translateZ(0) rotateZ(0)}50%{transform:translateZ(1.5px) rotateZ(5deg)}}
+.veille .head{transform:rotateX(22deg)}.fini .head{transform:rotateX(34deg)}
+.crown,.hs{position:absolute;left:0;top:0;width:0;height:0;transform-style:preserve-3d}
+.hair{position:absolute;background:var(--hair)}
+.bb{position:absolute;left:-72px;top:-34px;width:144px;height:34px;transform-origin:50% 100%;transform:translateZ(98px)}
+.bb .id{display:block;font:600 11px/1.3 ui-monospace,monospace;color:#e6e9f2;background:#0c0f17e0;border:1px solid #2b3246;
+ border-radius:6px;padding:1px 6px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;text-align:center}
+.bb .st{display:block;font-size:10px;color:var(--dim);text-align:center;margin-top:1px;text-shadow:0 1px 2px #000;white-space:nowrap}
+.action .bb .id{border-color:var(--act)}.veille .bb .id{border-color:#eab30899}.fini .bb{opacity:.55}
+.zzw{display:none;position:absolute;left:0;top:40px;width:0;height:0;transform-style:preserve-3d}
+.veille .zzw{display:block;animation:rise 3s ease-out infinite}.zzw.z2{animation-delay:1.5s}
+@keyframes rise{0%{transform:translateZ(66px);opacity:0}20%{opacity:1}100%{transform:translateZ(120px);opacity:0}}
+.zz{position:absolute;left:0;top:0;font:700 17px ui-sans-serif,system-ui,sans-serif;color:#facc15;transform-origin:0 100%}
+.beam{position:absolute;height:5px;margin-top:-2.5px;transform-origin:0 50%;
+ background:linear-gradient(90deg,#f59e0b33,#f59e0bdd);border-radius:3px;box-shadow:0 0 10px #f59e0b88}
+.beam.lu{opacity:.5}
+.beam i{position:absolute;top:-6px;left:0;width:17px;height:17px;border-radius:50%;background:#fde68a;
+ box-shadow:0 0 18px #f59e0b;animation:pk 1.4s linear infinite}
+@keyframes pk{from{left:0}to{left:calc(100% - 17px)}}
+/* ---- rendu WebGL : canevas + calque d'étiquettes HTML ---- */
+#stage.gl #world{display:none}
+#gl{position:absolute;inset:0;width:100%;height:100%;display:block}
+#ov{position:absolute;inset:0;overflow:hidden;pointer-events:none}
+#ov .lab{position:absolute;left:0;top:0;width:144px;height:34px;transform-origin:50% 100%;pointer-events:auto;will-change:transform}
+#ov .lab .bb{position:static;transform:none;width:auto;height:auto}
+#ov .rtitle{position:absolute;left:0;top:0;height:auto;line-height:1.25;transform:none;transform-origin:0 100%;will-change:transform}
+.zzl{position:absolute;left:0;top:0;font:700 17px ui-sans-serif,system-ui,sans-serif;color:#facc15;pointer-events:none;will-change:transform}
+.zzl span{display:inline-block;animation:zr 3s ease-out infinite}.zzl span+span{animation-delay:1.5s;margin-left:7px}
+@keyframes zr{0%{transform:translateY(8px);opacity:0}20%{opacity:1}100%{transform:translateY(-46px);opacity:0}}
+@media(prefers-reduced-motion:reduce){.desk3d *,.beam i,.zzl span{animation:none!important}}
+/* ---- coûts (équivalent Opus) et lien worktrees ---- */
+#bar a.btn{background:var(--piece);color:var(--txt);border:1px solid #2c3347;border-radius:8px;padding:5px 11px;
+ font-size:12.5px;text-decoration:none;display:inline-flex;gap:6px;align-items:center}
+#bar a.btn:hover{border-color:#4a5372}
+.badge{background:#2c3347;color:var(--txt);border-radius:999px;padding:0 7px;font-size:11.5px;font-weight:700;min-width:20px;text-align:center}
+.badge.rouge{background:#ef4444;color:#fff}
+#side{max-height:calc(100vh - 28px);overflow-y:auto}.panel ul{max-height:34vh}
+#cout table{width:100%;border-collapse:collapse;font-size:12.5px}
+#cout td{padding:3px 0;border-bottom:1px solid #1f2433}#cout td.n{text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap;padding-left:8px}
+#cout tr.tot td{font-weight:700;border-bottom:0;padding-top:6px}
+#cout .sub{color:var(--dim);font-size:11.5px;margin-top:6px;line-height:1.5}
+#cout svg{display:block;width:100%;height:42px;margin-top:8px}
+</style></head><body>
+<svg id="liens"></svg>
+<header><h1>🏢 __TITRE__ — les bureaux</h1><div><span id="counts"></span> <span id="refresh"></span></div></header>
+<div id="layout"><div id="left">
+ <div id="bar"><button id="bmode" type="button">Vue 2D</button>
+  <button id="bauto" class="only3d on" type="button" title="Balancement automatique de la caméra">↔ Balancement</button>
+  <a id="bln" class="btn" href="/liens" target="av-liens">🔗 Liens <span id="lnn" class="badge">…</span></a>
+  <a id="bwt" class="btn" href="/worktrees" target="av-worktrees">🌿 Worktrees non poussés <span id="wtn" class="badge">…</span></a>
+  <a id="bcs" class="btn" href="/conso" target="av-conso">📊 Conso & quotas</a>
+  <button id="breset" class="only3d" type="button" title="Recentrer la caméra (double-clic sur la scène)">⟲ Recentrer</button>
+  <span class="hint only3d">glisser : tourner · molette : zoomer · double-clic : recentrer · 🟢 en action · 💤 en veille · gris : fini</span>
+  <span class="hint" id="lgcls" title="Dev junior = moteurs local et second poste (modèles légers) ; réglable : AV_JUNIOR=local,strata"><b style="color:#f8fafc">■ Manager</b> · <b style="color:#facc15">■ Superviseur</b> · <b style="color:#3b82f6">■ Dev</b> · <b style="color:#fb7185">■ Dev junior</b> <span style="opacity:.7">(chemise + nom)</span></span></div>
+ <div id="bureaux"></div>
+ <div id="stage"><div id="world"></div></div></div>
+<div id="side">
+ <div class="panel" id="cout"><h3>💶 Tokens générés · équivalent Opus</h3><div id="coutb" class="sub">calcul en cours…</div></div>
+ <div class="panel"><h3>💬 Communications</h3><ul id="flux"></ul></div>
+ <div class="panel"><h3>🧵 Fils communs</h3><ul id="fils"></ul></div>
+</div></div>
+<script>
+const FREE_ROOMS=["mgr","local","strata","glm"];
+function freeRoom(h,st){return h==="mgr"||(FREE_ROOMS.includes(h)&&!!(st.slots&&st.slots[h]))}
+/* le manager a sa salle, toujours en premier : place fixe quel que soit son moteur ou son état */
+function inRoom(a,h){return h==="mgr"?a.classe==="mgr":(a.classe!=="mgr"&&a.harness===h)}
+function capTxt(h,cap,st){const s=h!=="mgr"&&st.slots&&st.slots[h];if(!s)return cap;
+ const v=st.agents.filter(a=>a.harness===h&&a.alive&&a.role==="dev").length;
+ return `${s.total} créneaux · ${s.pris} pris · ${s.libres} libre${s.libres>1?"s":""}`+(v&&!s.pris?` · ${v} dev hors verrou`:"")}
+const PIECES=[["mgr","Manager · poste fixe","1 poste","#f8fafc"]].concat(__PIECES_JSON__);
+const AV={sup:"🧑‍💼",dev:"🧑‍💻"},LBL={action:"en action",veille:"en veille",fini:"fini"};
+let last=null;
+const esc=s=>String(s==null?"":s).replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+function ago(s){if(s==null)return "—";if(s<60)return s+"s";if(s<3600)return Math.floor(s/60)+"m";return Math.floor(s/3600)+"h"+String(Math.floor(s%3600/60)).padStart(2,"0")}
+function desk(a){const d=document.createElement("div");d.className="desk "+a.state;
+ if(a.wt_short)d.title=a.worktree+(a.pid?"\npid "+a.pid:"")+"\ninscription "+a.since;
+ const wt=a.wt_short?`<span class="wt">${esc(a.wt_short)}</span>`:"";
+ const act=a.activity_ago!=null?`act. ${ago(a.activity_ago)}`:"";
+ d.innerHTML=`${wt}<span class="pers">${AV[a.role]||"🤖"}</span><span class="nom">${esc(a.id)}</span>
+ <div class="meta"><span><span class="dot d-${esc(a.state)}"></span>${esc(LBL[a.state])}</span><span>${esc(a.harness)}${act?" · "+act:""}</span></div>`;
+ return d}
+function draw(st){const root=document.getElementById("bureaux");root.innerHTML="";
+ for(const[h,name,cap0,col]of PIECES){const list=st.agents.filter(a=>inRoom(a,h));
+  if(!list.length&&!freeRoom(h,st))continue;const cap=capTxt(h,cap0,st);const p=document.createElement("div");p.className="piece";
+  p.innerHTML=`<h2><span class="swatch" style="background:${col}"></span>${name}
+   <span class="cap">${esc(cap)} · ${list.filter(a=>a.state==="action").length}/${list.length} actifs${ctx(h)}</span></h2>`;
+  const ds=document.createElement("div");ds.className="desks";
+  for(const a of list.sort((x,y)=>({action:0,veille:1,fini:2}[x.state]-{action:0,veille:1,fini:2}[y.state])||x.id.localeCompare(y.id))){
+   const e=desk(a);if(a.id===st.me)e.style.outline="2px dashed #9aa2b5";ds.appendChild(e)}
+  p.appendChild(ds);root.appendChild(p)}
+ const nA=st.agents.filter(a=>a.state==="action").length,nV=st.agents.filter(a=>a.state==="veille").length,
+ nF=st.agents.filter(a=>a.state==="fini").length;
+ document.getElementById("counts").innerHTML=`<span style="color:var(--act)">● ${nA} en action</span> ·
+  <span style="color:var(--vei)">◐ ${nV} en veille</span> · <span style="color:var(--fin)">· ${nF} finis</span>`;
+ const fx=document.getElementById("flux");fx.innerHTML="";
+ for(const m of st.messages.slice(0,25)){const li=document.createElement("li");
+  li.innerHTML=`<span class="route">${esc(m["from"])} → ${esc(m.to)}</span><span class="t">il y a ${ago(m.ago)}${m.read?"":" · <b>non lu</b>"}</span>
+  <span class="txt">${esc((m.text||"(vide)").split("\n")[0].slice(0,140))}</span>`;fx.appendChild(li)}
+ const fl=document.getElementById("fils");fl.innerHTML="";
+ for(const t of st.threads.slice(0,8)){const li=document.createElement("li");
+  li.innerHTML=`<span class="route">🧵 ${esc(t.name)}</span><span class="t">il y a ${ago(t.ago)}</span>
+  <span class="txt">${esc(t.last||"")}</span>`;fl.appendChild(li)}
+ if(MODE==="2d")drawLinks(st);else{document.getElementById("liens").innerHTML="";draw3d(st)}}
+function drawLinks(st){const svg=document.getElementById("liens");svg.innerHTML="";
+ document.querySelectorAll(".desk").forEach(d=>{rects[d.querySelector(".nom").textContent]=d.getBoundingClientRect()});
+ for(const m of st.messages.filter(m=>m.ago<180&&rects[m["from"]]&&rects[m.to])){
+  const a=rects[m["from"]],b=rects[m.to];
+  const l=document.createElementNS("http://www.w3.org/2000/svg","line");
+  l.setAttribute("x1",a.left+a.width/2);l.setAttribute("y1",a.top+a.height/2);
+  l.setAttribute("x2",b.left+b.width/2);l.setAttribute("y2",b.top+b.height/2);
+  l.setAttribute("title",m["from"]+" → "+m.to);
+  if(m["from"]===m.to)l.setAttribute("opacity","0.15");
+  svg.appendChild(l)}}
+/* ===== Vue 3D : CSS 3D pur, sans dépendance ===== */
+let MODE="3d";try{if(localStorage.getItem("av-mode")==="2d")MODE="2d"}catch(e){}
+const REDUCED=!!(window.matchMedia&&matchMedia("(prefers-reduced-motion:reduce)").matches);
+const CAM0={rx:56,rz:-24},cam={rx:CAM0.rx,rz:CAM0.rz,zoom:1,auto:!REDUCED,fit:1,sway:0,ox:0,oy:0};
+const CW=140,CH=122,RPAD=22,RHEAD=44,GAPX=60,GAPY=48,RANK={action:0,veille:1,fini:2};
+const SKIN=["#f1c27d","#e0ac69","#c68642","#8d5524","#ffdbac"],HAIR=["#2b2118","#15110d","#5a3a1e","#b8860b","#6b6b6b"];
+const S3={rooms:{},desks:{},beams:{},pos:{},W:1,H:1,bbs:[],titles:[],zz:[]};
+const GL={on:false,gl:null,cv:null,st:null,ov:null,U:{},dirty:true,animating:false,sw:1,sh:1,rooms:[],desks:[],beams:[],lab:{},ttl:{},zz:{},lod:"",t0:performance.now()};
+function hsh(s){let h=7;for(const c of s)h=(h*31+c.charCodeAt(0))>>>0;return h}
+function el(html,cls){const d=document.createElement("div");d.className=cls;d.innerHTML=html;return d}
+/* pavé : empreinte x,y,w×d au sol, base à la hauteur z, hauteur h (z vers le haut) */
+function bx(x,y,z,w,d,h,c,cl){return `<div class="bx ${cl||""}" style="left:${x}px;top:${y}px;width:${w}px;height:${d}px;--c:${c};transform:translateZ(${z}px)">`
+ +`<i class="t" style="transform:translateZ(${h}px)"></i>`
+ +`<i class="fr" style="top:${d}px;width:${w}px;height:${h}px"></i>`
+ +`<i class="lf" style="width:${h}px;height:${d}px"></i>`
+ +`<i class="rt" style="left:${w}px;width:${h}px;height:${d}px"></i></div>`}   /* pas de face arrière : jamais visible */
+/* modèle « full » (agents actifs / en veille, peu nombreux) ou « lite » (agents finis, la majorité : peu de faces) */
+const CLS={mgr:["MANAGER","#f8fafc"],sup:["SUP","#facc15"],dev:["DEV","#3b82f6"],junior:["JUNIOR","#fb7185"]};
+const clsOf=a=>a.classe||(a.role==="mgr"?"mgr":a.role==="sup"?"sup":"dev");
+function deskHTML(kind,role){
+ const tail=`<div class="bb"><b class="id"></b><span class="st"></span></div>`;
+ if(kind==="lite")return `<div class="pad"></div>`+bx(-50,-30,0,100,48,30,"var(--deskc)")
+  +bx(-26,-22,36,52,5,28,"#1b2030")+`<i class="scr"></i>`
+  +bx(-12,32,0,24,16,42,"var(--torso)")+`<div class="head">`+bx(-10,34,42,20,18,17,"var(--skin)")+`</div>`+tail;
+ return `<div class="pad"></div>`+bx(-50,-30,0,100,48,30,"var(--deskc)")
+  +bx(-26,-22,36,52,5,28,"#1b2030")+`<i class="scr"></i><i class="kb"></i>`
+  +bx(-15,28,10,30,26,5,"#232a3b")+bx(-15,50,15,30,4,26,"#232a3b")
+  +bx(-12,32,15,24,16,27,"var(--torso)")
+  +`<div class="arm l">`+bx(-20,4,32,8,30,7,"var(--torso)")+`</div>`
+  +`<div class="arm r">`+bx(12,4,32,8,30,7,"var(--torso)")+`</div>`
+  +`<div class="head">`+bx(-10,34,42,20,18,17,"var(--skin)")+`<i class="hair" style="left:-10px;top:34px;width:20px;height:18px;transform:translateZ(59.3px)"></i>`
+  +(role==="sup"||role==="mgr"?`<div class="crown">`+bx(-10,34,59.5,20,18,3,"#f5c518")+`</div>`
+   :`<div class="hs">`+bx(-13,40,47,3,7,8,"#1a1d28")+bx(10,40,47,3,7,8,"#1a1d28")+`</div>`)+`</div>`
+  +`<div class="zzw"><div class="zz">Z</div></div><div class="zzw z2"><div class="zz">z</div></div>`+tail}
+/* Caméra : un seul transform sur #world (aucune variable CSS héritée → pas de recalcul de style sur toute la scène).
+   Les étiquettes face caméra sont recalées en JS (quelques dizaines d'éléments). */
+function applyCam(){if(GL.on){GL.dirty=true;return}
+ const s=document.getElementById("stage"),w=document.getElementById("world"),z=cam.fit*cam.zoom,rz=cam.rz+cam.sway;
+ w.style.transform=`translate3d(${cam.ox.toFixed(1)}px,${cam.oy.toFixed(1)}px,0) scale(${z.toFixed(4)}) rotateX(${cam.rx.toFixed(2)}deg) rotateZ(${rz.toFixed(2)}deg) translate3d(${(-S3.W/2).toFixed(1)}px,${(-S3.H/2).toFixed(1)}px,0)`;
+ const lod=z<.6?"far":z<1.05?"mid":"near";if(s.dataset.lod!==lod)s.dataset.lod=lod;
+ const bb=`rotateZ(${(-rz).toFixed(2)}deg) rotateX(${(-cam.rx).toFixed(2)}deg)`;
+ for(const e of S3.bbs)e.style.transform="translateZ(98px) "+bb;
+ for(const e of S3.titles)e.style.transform="translateZ(122px) "+bb;
+ for(const e of S3.zz)e.style.transform=bb}
+function fitScale(W,H,s){const a=Math.abs(CAM0.rz)*Math.PI/180,r=CAM0.rx*Math.PI/180;
+ const wr=W*Math.cos(a)+H*Math.sin(a)+120,hr=(W*Math.sin(a)+H*Math.cos(a))*Math.sin(r)+170*Math.cos(r)+60;
+ return Math.min(s.clientWidth*.94/wr,s.clientHeight*.94/hr)}
+/* échelle + centrage MESURÉS : on projette les sols à l'écran (perspective comprise) et on cadre la scène */
+function refit(){const s=document.getElementById("stage"),w=document.getElementById("world");if(!s.clientWidth)return;
+ const sv={rx:cam.rx,rz:cam.rz,zoom:cam.zoom,sway:cam.sway};
+ cam.rx=CAM0.rx;cam.rz=CAM0.rz;cam.zoom=1;cam.sway=0;cam.ox=0;cam.oy=0;cam.fit=fitScale(S3.W,S3.H,s);
+ for(let it=0;it<3;it++){
+  applyCam();
+  const sr=s.getBoundingClientRect();let x0=1e9,y0=1e9,x1=-1e9,y1=-1e9;   // sr = cadre de la scène
+  for(const f of w.querySelectorAll(".floor,.wall")){const r=f.getBoundingClientRect();
+   x0=Math.min(x0,r.left);y0=Math.min(y0,r.top);x1=Math.max(x1,r.right);y1=Math.max(y1,r.bottom)}
+  const bw=x1-x0,bh=y1-y0;if(!(bw>0&&bh>0))break;
+  cam.fit*=Math.max(.5,Math.min(2,Math.min(s.clientWidth*.94/bw,s.clientHeight*.84/bh)));
+  cam.ox+=sr.left+sr.width/2-(x0+x1)/2;cam.oy+=sr.top+sr.height/2+14-(y0+y1)/2}
+ cam.rx=sv.rx;cam.rz=sv.rz;cam.zoom=sv.zoom;cam.sway=sv.sway;applyCam()}
+function drawCss(st){
+ const stage=document.getElementById("stage"),world=document.getElementById("world");
+ if(!stage.clientWidth)return;
+ const base=[];
+ for(const[h,name,cap0,col]of PIECES){
+  const list=st.agents.filter(a=>inRoom(a,h)).sort((x,y)=>(RANK[x.state]-RANK[y.state])||x.id.localeCompare(y.id));
+  if(list.length||freeRoom(h,st))base.push({h,name,cap:capTxt(h,cap0,st),col,list})}
+ /* disposition : on essaie 1 à 3 colonnes de salles et 2 à 8 bureaux par ligne, on garde la plus lisible (échelle max) */
+ const plan=(nc,colsMax)=>{
+  const gs=base.map(b=>{const cols=Math.max(1,Math.min(colsMax,b.list.length)),rows=Math.ceil(b.list.length/cols);
+   return {...b,cols,rows,w:cols*CW+2*RPAD,hh:rows*CH+RHEAD+RPAD}});
+  const colY=Array(nc).fill(0),colW=Array(nc).fill(0);
+  for(const g of gs){let c=0;for(let i=1;i<nc;i++)if(colY[i]<colY[c])c=i;
+   g.c=c;g.y=colY[c];colY[c]+=g.hh+GAPY;colW[c]=Math.max(colW[c],g.w)}
+  const colX=[];let xx=0;for(let i=0;i<nc;i++){colX[i]=xx;xx+=colW[i]+GAPX}
+  for(const g of gs)g.x=colX[g.c]+(colW[g.c]-g.w)/2;
+  const W=Math.max(1,xx-GAPX),H=Math.max(1,Math.max(...colY)-GAPY);
+  return {gs,W,H,f:fitScale(W,H,stage)}};
+ let best=null;
+ for(const nc of [1,2,3])for(const cm of [2,3,4,5,6,8]){const p=plan(nc,cm);if(!best||p.f>best.f*1.001)best=p}
+ const groups=best.gs;S3.W=best.W;S3.H=best.H;
+ const seenR=new Set(),seenD=new Set();S3.pos={};
+ for(const g of groups){
+  let r=S3.rooms[g.h];
+  if(!r){r=el(`<div class="floor"></div><div class="wall"></div><div class="rtitle"></div>`,"room");
+   S3.rooms[g.h]=r;world.insertBefore(r,world.firstChild)}
+  r.style.cssText=`--rc:${g.col};left:${g.x}px;top:${g.y}px;width:${g.w}px;height:${g.hh}px`;
+  r.querySelector(".rtitle").innerHTML=`${g.name}<small>${esc(g.cap)} · ${g.list.filter(a=>a.state==="action").length}/${g.list.length} actifs${ctx(g.h)}</small>`;
+  seenR.add(g.h);
+  g.list.forEach((a,i)=>{
+   const cx=RPAD+(i%g.cols)*CW+CW/2,cy=RHEAD+Math.floor(i/g.cols)*CH+44;
+   S3.pos[a.id]=[g.x+cx,g.y+cy];
+   let d=S3.desks[a.id];if(!d){d=el("","desk3d");S3.desks[a.id]=d}
+   const kind=a.state==="fini"?"lite":"full-"+(a.role==="sup"||a.role==="mgr"?"sup":"dev");
+   if(d.dataset.kind!==kind){d.innerHTML=deskHTML(a.state==="fini"?"lite":"full",a.role);d.dataset.kind=kind}
+   if(d.parentNode!==r)r.appendChild(d);
+   d.className="desk3d "+a.state+" "+(a.role==="sup"||a.role==="mgr"?"sup":"dev")+(a.id===st.me?" me":"");
+   d.style.cssText=`left:${cx}px;top:${cy}px;--pc:${CLS[clsOf(a)][1]};--sk:${SKIN[hsh(a.id)%SKIN.length]};--hr:${HAIR[(hsh(a.id)>>>3)%HAIR.length]}`;
+   d.title=a.id+"\n"+a.worktree+(a.pid?"\npid "+a.pid:"")+"\ninscription "+a.since;
+   d.querySelector(".id").textContent=a.id;d.querySelector(".id").style.color=CLS[clsOf(a)][1];
+   d.querySelector(".st").textContent=CLS[clsOf(a)][0]+" · "+LBL[a.state]+" · "+a.harness+(a.activity_ago!=null?" · "+ago(a.activity_ago):"");
+   seenD.add(a.id)})}
+ for(const k in S3.desks)if(!seenD.has(k)){S3.desks[k].remove();delete S3.desks[k]}
+ for(const k in S3.rooms)if(!seenR.has(k)){S3.rooms[k].remove();delete S3.rooms[k]}
+ const live=new Set();
+ for(const m of st.messages){
+  if(m.ago>=180||m["from"]===m.to)continue;
+  const a=S3.pos[m["from"]],b=S3.pos[m.to];if(!a||!b)continue;
+  const k=m["from"]+">"+m.to;if(live.has(k))continue;live.add(k);
+  let e=S3.beams[k];if(!e){e=el("<i></i>","beam");world.appendChild(e);S3.beams[k]=e}
+  const dx=b[0]-a[0],dy=b[1]-a[1];
+  e.style.cssText=`left:${a[0]}px;top:${a[1]}px;width:${Math.hypot(dx,dy)}px;transform:translateZ(106px) rotateZ(${Math.atan2(dy,dx)*180/Math.PI}deg)`;
+  e.classList.toggle("lu",!!m.read)}
+ for(const k in S3.beams)if(!live.has(k)){S3.beams[k].remove();delete S3.beams[k]}
+ S3.bbs=[...world.querySelectorAll(".bb")];S3.titles=[...world.querySelectorAll(".rtitle")];S3.zz=[...world.querySelectorAll(".veille .zz")];
+ const sig=[S3.W,S3.H,stage.clientWidth,stage.clientHeight].join("|");   // recadrage seulement si la scène ou la fenêtre change
+ if(sig!==S3.sig){S3.sig=sig;refit()}else applyCam()}
+function setAuto(on){cam.auto=on;if(!on){cam.rz+=cam.sway;cam.sway=0}
+ document.getElementById("bauto").classList.toggle("on",on);applyCam()}
+function setMode(m){MODE=m;try{localStorage.setItem("av-mode",m)}catch(e){}
+ document.body.classList.toggle("m2d",m==="2d");document.body.classList.toggle("m3d",m==="3d");
+ document.getElementById("bmode").textContent=m==="3d"?"Vue 2D":"Vue 3D";
+ if(last)draw(last)}
+function recenter(){cam.rx=CAM0.rx;cam.rz=CAM0.rz;cam.zoom=1;cam.sway=0;GL.on?refitGL():refit()}
+(function(){const s=document.getElementById("stage");let drag=null;
+ s.addEventListener("pointerdown",e=>{if(e.button!==0)return;setAuto(false);drag={x:e.clientX,y:e.clientY};
+  try{s.setPointerCapture(e.pointerId)}catch(_){}s.classList.add("drag")});
+ s.addEventListener("pointermove",e=>{if(!drag)return;
+  cam.rz=Math.max(-80,Math.min(80,cam.rz+(e.clientX-drag.x)*.3));cam.rx=Math.max(22,Math.min(84,cam.rx-(e.clientY-drag.y)*.25));
+  drag.x=e.clientX;drag.y=e.clientY;applyCam()});
+ const up=()=>{drag=null;s.classList.remove("drag")};s.addEventListener("pointerup",up);s.addEventListener("pointercancel",up);
+ s.addEventListener("wheel",e=>{e.preventDefault();cam.zoom=Math.max(.35,Math.min(3,cam.zoom*Math.exp(-e.deltaY*.0012)));applyCam()},{passive:false});
+ s.addEventListener("dblclick",recenter);
+ document.getElementById("bmode").addEventListener("click",()=>setMode(MODE==="3d"?"2d":"3d"));
+ document.getElementById("bauto").addEventListener("click",()=>setAuto(!cam.auto));
+ document.getElementById("breset").addEventListener("click",recenter);
+ let lt=0;(function loop(t){if(MODE==="3d"&&cam.auto&&!GL.on&&t-lt>33){lt=t;cam.sway=Math.sin(t/4200)*9;applyCam()}requestAnimationFrame(loop)})(0)})();
+/* ===== Rendu WebGL (fluide). Même caméra que le CSS 3D : translate · scale · rotateX · rotateZ + perspective. ===== */
+const PERSP=2400,POY=.36;
+const GLV=`attribute vec3 aP;attribute vec3 aN;
+uniform vec3 uDesk,uLocal,uSize,uPivot,uC;uniform mat3 uRot;uniform vec2 uStage,uPO,uO;
+uniform float uCz,uSz,uCx,uSx,uS,uP;
+varying vec3 vN,vW,vL;
+void main(){
+ vec3 lp=aP*uSize+uLocal;vec3 wp=uDesk+uPivot+uRot*(lp-uPivot);
+ vN=uRot*aN;vW=wp;vL=aP*uSize;
+ vec3 q=wp-uC;
+ q=vec3(q.x*uCz-q.y*uSz,q.x*uSz+q.y*uCz,q.z);
+ q=vec3(q.x,q.y*uCx-q.z*uSx,q.y*uSx+q.z*uCx);
+ q*=uS;q.xy+=uO;
+ float f=uP/max(uP-q.z,60.);
+ vec2 scr=uPO+(uStage*.5+q.xy-uPO)*f;
+ float w=1./f;
+ gl_Position=vec4(vec2(scr.x/uStage.x*2.-1.,1.-scr.y/uStage.y*2.)*w,(-q.z/4000.)*w,w);}`;
+const GLF=`#ifdef GL_FRAGMENT_PRECISION_HIGH
+precision highp float;
+#else
+precision mediump float;
+#endif
+uniform vec4 uCol;uniform vec3 uC2,uSize;uniform float uMode,uT;
+varying vec3 vN,vW,vL;
+void main(){
+ vec3 n=normalize(vN);
+ float lit=.52+.48*max(dot(n,normalize(vec3(-.4,.55,.75))),0.);
+ vec3 c=uCol.rgb*lit;float a=uCol.a;
+ float ed=min(min(vL.x,uSize.x-vL.x),min(vL.y,uSize.y-vL.y));
+ if(uMode>.5&&uMode<1.5){float s=step(.5,fract(vW.z*.16-uT*1.6));c=mix(uCol.rgb*.22,uCol.rgb,.12+.88*s);}
+ else if(uMode>1.5&&uMode<2.5){vec2 g=abs(fract(vL.xy/50.)-.5);float ln=step(.47,max(g.x,g.y));
+  c=uCol.rgb*(1.+.7*ln);if(ed<3.&&n.z>.5)c=uC2;}
+ else if(uMode>2.5&&uMode<3.5){c=uCol.rgb;}
+ else if(uMode>3.5){c=uCol.rgb;a=uCol.a*(ed<2.5?3.:1.);}
+ gl_FragColor=vec4(c,min(a,1.));}`;
+const hex3=h=>[parseInt(h.slice(1,3),16)/255,parseInt(h.slice(3,5),16)/255,parseInt(h.slice(5,7),16)/255];
+const Z3=[0,0,0],IDENT=new Float32Array([1,0,0,0,1,0,0,0,1]),HEADPIV=[0,43,50];
+const rotX=a=>{const c=Math.cos(a),s=Math.sin(a);return new Float32Array([1,0,0,0,c,s,0,-s,c])};
+const rotZ=a=>{const c=Math.cos(a),s=Math.sin(a);return new Float32Array([c,s,0,-s,c,0,0,0,1])};
+const CL={desk:hex3("#2d3449"),deskF:hex3("#222734"),mon:hex3("#1b2030"),kb:hex3("#2b3146"),seat:hex3("#232a3b"),
+ torsoF:hex3("#3a3f4e"),skinF:hex3("#5b6272"),hairF:hex3("#2e333f"),crown:hex3("#f5c518"),hs:hex3("#1a1d28"),
+ scrA:hex3("#22c55e"),scrV:hex3("#a58a14"),scrF:hex3("#0a0c12"),amber:hex3("#f59e0b"),pale:hex3("#fde68a"),
+ padA:hex3("#22c55e"),padV:hex3("#eab308"),padF:hex3("#8890a8"),me:hex3("#e6e9f2"),wall:hex3("#141824")};
+/* pièces d'un bureau : [x,y,z,w,d,h,couleur,animation] ; « scr » = écran */
+const PART_LITE=[[-50,-30,0,100,48,30,"desk"],[-26,-22,36,52,5,28,"mon"],[-23,-16.7,38,46,.6,24,"scr"],
+ [-12,32,0,24,16,42,"torso"],[-10,34,42,20,18,17,"skin","head"]];
+const PART_FULL=[[-50,-30,0,100,48,30,"desk"],[-26,-22,36,52,5,28,"mon"],[-23,-16.7,38,46,.6,24,"scr"],[-17,-2,30,34,12,.8,"kb"],
+ [-15,28,10,30,26,5,"seat"],[-15,50,15,30,4,26,"seat"],[-12,32,15,24,16,27,"torso"],
+ [-20,4,32,8,30,7,"torso","armL"],[12,4,32,8,30,7,"torso","armR"],
+ [-10,34,42,20,18,17,"skin","head"],[-10,34,59,20,18,1,"hair","head"]];
+const PART_SUP=PART_FULL.concat([[-10,34,60,20,18,3,"crown","head"]]);
+const PART_DEV=PART_FULL.concat([[-13,40,47,3,7,8,"hs","head"],[10,40,47,3,7,8,"hs","head"]]);
+function glInit(){
+ try{
+  const st=document.getElementById("stage"),cv=document.createElement("canvas");cv.id="gl";
+  const gl=cv.getContext("webgl",{antialias:true,alpha:false});if(!gl)return false;
+  const sh=(t,s)=>{const o=gl.createShader(t);gl.shaderSource(o,s);gl.compileShader(o);
+   if(!gl.getShaderParameter(o,gl.COMPILE_STATUS))throw new Error(gl.getShaderInfoLog(o));return o};
+  const pr=gl.createProgram();gl.attachShader(pr,sh(gl.VERTEX_SHADER,GLV));gl.attachShader(pr,sh(gl.FRAGMENT_SHADER,GLF));
+  gl.bindAttribLocation(pr,0,"aP");gl.bindAttribLocation(pr,1,"aN");gl.linkProgram(pr);
+  if(!gl.getProgramParameter(pr,gl.LINK_STATUS))throw new Error(gl.getProgramInfoLog(pr));
+  gl.useProgram(pr);
+  for(const n of ["uDesk","uLocal","uSize","uPivot","uC","uC2","uRot","uStage","uPO","uO","uCz","uSz","uCx","uSx","uS","uP","uCol","uMode","uT"])GL.U[n]=gl.getUniformLocation(pr,n);
+  const F=[[[1,0,0],[1,1,0],[1,1,1],[1,0,1],[1,0,0]],[[0,1,0],[0,0,0],[0,0,1],[0,1,1],[-1,0,0]],
+   [[1,1,0],[0,1,0],[0,1,1],[1,1,1],[0,1,0]],[[0,0,0],[1,0,0],[1,0,1],[0,0,1],[0,-1,0]],
+   [[0,0,1],[1,0,1],[1,1,1],[0,1,1],[0,0,1]],[[0,1,0],[1,1,0],[1,0,0],[0,0,0],[0,0,-1]]];
+  const V=[],I=[];F.forEach((f,i)=>{for(let k=0;k<4;k++)V.push(...f[k],...f[4]);I.push(4*i,4*i+1,4*i+2,4*i,4*i+2,4*i+3)});
+  const vb=gl.createBuffer();gl.bindBuffer(gl.ARRAY_BUFFER,vb);gl.bufferData(gl.ARRAY_BUFFER,new Float32Array(V),gl.STATIC_DRAW);
+  const ib=gl.createBuffer();gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER,ib);gl.bufferData(gl.ELEMENT_ARRAY_BUFFER,new Uint16Array(I),gl.STATIC_DRAW);
+  gl.enableVertexAttribArray(0);gl.vertexAttribPointer(0,3,gl.FLOAT,false,24,0);
+  gl.enableVertexAttribArray(1);gl.vertexAttribPointer(1,3,gl.FLOAT,false,24,12);
+  gl.enable(gl.DEPTH_TEST);gl.depthFunc(gl.LEQUAL);gl.blendFunc(gl.SRC_ALPHA,gl.ONE_MINUS_SRC_ALPHA);
+  const ov=document.createElement("div");ov.id="ov";
+  st.insertBefore(ov,st.firstChild);st.insertBefore(cv,st.firstChild);st.classList.add("gl");
+  cv.addEventListener("webglcontextlost",e=>{e.preventDefault();GL.on=false;st.classList.remove("gl");ov.remove();cv.remove();if(last)draw3d(last)});
+  Object.assign(GL,{gl,cv,st,ov});return true;
+ }catch(e){return false}}
+function glResize(){const s=GL.st,w=s.clientWidth,h=s.clientHeight,r=Math.min(window.devicePixelRatio||1,2);
+ const pw=Math.max(1,Math.round(w*r)),ph=Math.max(1,Math.round(h*r));
+ if(GL.cv.width!==pw||GL.cv.height!==ph){GL.cv.width=pw;GL.cv.height=ph;GL.dirty=true}
+ GL.gl.viewport(0,0,pw,ph);GL.sw=w;GL.sh=h}
+function glProj(x,y,z,c){
+ const a=c.rz*Math.PI/180,b=c.rx*Math.PI/180,cz=Math.cos(a),sz=Math.sin(a),cx=Math.cos(b),sx=Math.sin(b);
+ const X=x-S3.W/2,Y=y-S3.H/2;let x1=X*cz-Y*sz,y1=X*sz+Y*cz;
+ let y2=y1*cx-z*sx,z2=y1*sx+z*cx;x1=x1*c.s+c.ox;y2=y2*c.s+c.oy;z2*=c.s;
+ const f=PERSP/Math.max(PERSP-z2,60),pox=GL.sw/2,poy=GL.sh*POY;
+ return [pox+(GL.sw/2+x1-pox)*f,poy+(GL.sh/2+y2-poy)*f]}
+/* cadrage numérique : on projette les salles (caméra de base) et on ajuste échelle + décalage */
+function refitGL(){
+ const c={rz:CAM0.rz,rx:CAM0.rx,s:fitScale(S3.W,S3.H,GL.st),ox:0,oy:0};
+ for(let it=0;it<4;it++){let x0=1e9,y0=1e9,x1=-1e9,y1=-1e9;
+  for(const r of GL.rooms)for(const q of [[r.x,r.y,0],[r.x+r.w,r.y,0],[r.x,r.y+r.hh,0],[r.x+r.w,r.y+r.hh,0],[r.x,r.y,58],[r.x+r.w,r.y,58]]){
+   const p=glProj(q[0],q[1],q[2],c);x0=Math.min(x0,p[0]);y0=Math.min(y0,p[1]);x1=Math.max(x1,p[0]);y1=Math.max(y1,p[1])}
+  const bw=x1-x0,bh=y1-y0;if(!(bw>0&&bh>0))break;
+  c.s*=Math.max(.5,Math.min(2,Math.min(GL.sw*.94/bw,GL.sh*.84/bh)));
+  c.ox+=GL.sw/2-(x0+x1)/2;c.oy+=GL.sh/2+14-(y0+y1)/2}
+ cam.fit=c.s;cam.ox=c.ox;cam.oy=c.oy;GL.dirty=true}
+function draw3d(st){GL.on?drawGL(st):drawCss(st)}
+function drawGL(st){
+ const stage=GL.st;if(!stage.clientWidth)return;glResize();
+ const base=[];
+ for(const[h,name,cap0,col]of PIECES){
+  const list=st.agents.filter(a=>inRoom(a,h)).sort((x,y)=>(RANK[x.state]-RANK[y.state])||x.id.localeCompare(y.id));
+  if(list.length||freeRoom(h,st))base.push({h,name,cap:capTxt(h,cap0,st),col,list})}
+ const plan=(nc,colsMax)=>{
+  const gs=base.map(b=>{const cols=Math.max(1,Math.min(colsMax,b.list.length)),rows=Math.ceil(b.list.length/cols);
+   return {...b,cols,rows,w:cols*CW+2*RPAD,hh:rows*CH+RHEAD+RPAD}});
+  const colY=Array(nc).fill(0),colW=Array(nc).fill(0);
+  for(const g of gs){let c=0;for(let i=1;i<nc;i++)if(colY[i]<colY[c])c=i;g.c=c;g.y=colY[c];colY[c]+=g.hh+GAPY;colW[c]=Math.max(colW[c],g.w)}
+  const colX=[];let xx=0;for(let i=0;i<nc;i++){colX[i]=xx;xx+=colW[i]+GAPX}
+  for(const g of gs)g.x=colX[g.c]+(colW[g.c]-g.w)/2;
+  const W=Math.max(1,xx-GAPX),H=Math.max(1,Math.max(...colY)-GAPY);
+  return {gs,W,H,f:fitScale(W,H,stage)}};
+ let best=null;
+ for(const nc of [1,2,3])for(const cm of [2,3,4,5,6,8]){const p=plan(nc,cm);if(!best||p.f>best.f*1.001)best=p}
+ S3.W=best.W;S3.H=best.H;S3.pos={};GL.rooms=[];GL.desks=[];GL.beams=[];
+ const ov=GL.ov,seenL=new Set(),seenT=new Set();
+ for(const g of best.gs){
+  GL.rooms.push({h:g.h,x:g.x,y:g.y,w:g.w,hh:g.hh,col:hex3(g.col)});
+  let t=GL.ttl[g.h];if(!t){t=document.createElement("div");t.className="rtitle";ov.appendChild(t);GL.ttl[g.h]=t}
+  t.style.color=g.col;t.innerHTML=`${g.name}<small>${esc(g.cap)} · ${g.list.filter(a=>a.state==="action").length}/${g.list.length} actifs${ctx(g.h)}</small>`;
+  seenT.add(g.h);
+  g.list.forEach((a,i)=>{
+   const x=g.x+RPAD+(i%g.cols)*CW+CW/2,y=g.y+RHEAD+Math.floor(i/g.cols)*CH+44;S3.pos[a.id]=[x,y];
+   let lab=GL.lab[a.id];if(!lab){lab=el(`<div class="bb"><b class="id"></b><span class="st"></span></div>`,"lab");ov.appendChild(lab);GL.lab[a.id]=lab}
+   lab.className="lab "+a.state;lab.title=a.id+"\n"+a.worktree+(a.pid?"\npid "+a.pid:"")+"\ninscription "+a.since;
+   lab.querySelector(".id").textContent=a.id;lab.querySelector(".id").style.color=CLS[clsOf(a)][1];
+   lab.querySelector(".st").textContent=CLS[clsOf(a)][0]+" · "+LBL[a.state]+" · "+a.harness+(a.activity_ago!=null?" · "+ago(a.activity_ago):"");
+   lab.querySelector(".id").style.borderColor=a.id===st.me?"#cfd5e6":"";
+   if(a.state==="veille"){if(!GL.zz[a.id]){const z=el("<span>Z</span><span>z</span>","zzl");ov.appendChild(z);GL.zz[a.id]=z}}
+   else if(GL.zz[a.id]){GL.zz[a.id].remove();delete GL.zz[a.id]}
+   const hsx=hsh(a.id);
+   GL.desks.push({id:a.id,x,y,state:a.state,role:a.role,pc:hex3(CLS[clsOf(a)][1]),sk:hex3(SKIN[hsx%SKIN.length]),hr:hex3(HAIR[(hsx>>>3)%HAIR.length]),
+    me:a.id===st.me,ph:(hsx%100)/100});
+   seenL.add(a.id)})}
+ for(const k in GL.lab)if(!seenL.has(k)){GL.lab[k].remove();delete GL.lab[k];if(GL.zz[k]){GL.zz[k].remove();delete GL.zz[k]}}
+ for(const k in GL.ttl)if(!seenT.has(k)){GL.ttl[k].remove();delete GL.ttl[k]}
+ for(const m of st.messages){
+  if(m.ago>=180||m["from"]===m.to)continue;
+  const a=S3.pos[m["from"]],b=S3.pos[m.to];if(a&&b)GL.beams.push({a,b,read:!!m.read})}
+ GL.animating=GL.beams.length>0||GL.desks.some(d=>d.state!=="fini");
+ const sig=[S3.W,S3.H,GL.sw,GL.sh].join("|");
+ if(sig!==S3.sig){S3.sig=sig;refitGL()}
+ GL.dirty=true}
+function glFrame(now){
+ requestAnimationFrame(glFrame);
+ if(!GL.on||MODE!=="3d"||document.hidden)return;
+ if(cam.auto){cam.sway=Math.sin(now/4200)*9;GL.dirty=true}
+ if(!(GL.dirty||GL.animating))return;
+ GL.dirty=false;glRender((now-GL.t0)/1000)}
+function glRender(t){
+ const gl=GL.gl,U=GL.U,rz=cam.rz+cam.sway,z=cam.fit*cam.zoom,a=rz*Math.PI/180,b=cam.rx*Math.PI/180;
+ gl.clearColor(.055,.063,.09,1);gl.clear(gl.COLOR_BUFFER_BIT|gl.DEPTH_BUFFER_BIT);
+ gl.uniform3f(U.uC,S3.W/2,S3.H/2,0);gl.uniform1f(U.uCz,Math.cos(a));gl.uniform1f(U.uSz,Math.sin(a));
+ gl.uniform1f(U.uCx,Math.cos(b));gl.uniform1f(U.uSx,Math.sin(b));gl.uniform1f(U.uS,z);gl.uniform2f(U.uO,cam.ox,cam.oy);
+ gl.uniform2f(U.uStage,GL.sw,GL.sh);gl.uniform2f(U.uPO,GL.sw/2,GL.sh*POY);gl.uniform1f(U.uP,PERSP);gl.uniform1f(U.uT,t);
+ const box=(dx,dy,x,y,zz,w,d,h,col,al,mode,rot,piv,c2)=>{
+  gl.uniform3f(U.uDesk,dx,dy,0);gl.uniform3f(U.uLocal,x,y,zz);gl.uniform3f(U.uSize,w,d,h);
+  gl.uniform3f(U.uPivot,piv[0],piv[1],piv[2]);gl.uniformMatrix3fv(U.uRot,false,rot);
+  gl.uniform4f(U.uCol,col[0],col[1],col[2],al);gl.uniform1f(U.uMode,mode);
+  if(c2)gl.uniform3f(U.uC2,c2[0],c2[1],c2[2]);
+  gl.drawElements(gl.TRIANGLES,36,gl.UNSIGNED_SHORT,0)};
+ gl.disable(gl.BLEND);gl.depthMask(true);
+ for(const r of GL.rooms){
+  const tint=r.col.map((v,i)=>v*.1+[.07,.08,.11][i]*.9);
+  box(0,0,r.x,r.y,-3,r.w,r.hh,3,tint,1,2,IDENT,Z3,r.col);
+  box(0,0,r.x,r.y,0,r.w,4,58,r.col.map((v,i)=>v*.28+CL.wall[i]*.72),1,0,IDENT,Z3)}
+ for(const d of GL.desks){
+  const f=d.state==="fini",parts=f?PART_LITE:(d.role==="sup"||d.role==="mgr"?PART_SUP:PART_DEV);
+  for(const p of parts){
+   let rot=IDENT,piv=Z3,lift=0,col,mode=0;const k=p[6];
+   if(k==="desk")col=f?CL.deskF:CL.desk;else if(k==="mon")col=CL.mon;else if(k==="kb")col=CL.kb;else if(k==="seat")col=CL.seat;
+   else if(k==="torso")col=f?CL.torsoF:d.pc;else if(k==="skin")col=f?CL.skinF:d.sk;else if(k==="hair")col=f?CL.hairF:d.hr;
+   else if(k==="crown")col=CL.crown;else if(k==="hs")col=CL.hs;
+   else if(k==="scr"){if(d.state==="action"){col=CL.scrA;mode=1}else if(d.state==="veille"){col=CL.scrV;mode=3}else col=CL.scrF}
+   const an=p[7];
+   if(an==="armL"||an==="armR"){if(d.state==="action")lift=3.5*(.5+.5*Math.sin((t/.4+(an==="armR"?.25:0))*6.2832))}
+   else if(an==="head"){piv=HEADPIV;
+    if(d.state==="action"){const s=Math.sin(t/1.8*6.2832+d.ph*6.2832);rot=rotZ(.0873*s);lift=1.5*(.5+.5*s)}
+    else if(d.state==="veille")rot=rotX(.384);else rot=rotX(.594)}
+   box(d.x,d.y,p[0],p[1],p[2]+lift,p[3],p[4],p[5],col,1,mode,rot,piv)}}
+ gl.enable(gl.BLEND);gl.depthMask(false);
+ for(const d of GL.desks){
+  let col=CL.padF,al=.05;
+  if(d.state==="action"){col=CL.padA;al=.16+.1*Math.sin(t*3.9)}else if(d.state==="veille"){col=CL.padV;al=.09}
+  if(d.me){col=CL.me;al=Math.max(al,.12)}
+  box(d.x,d.y,-66,-42,.7,132,118,.4,col,al,4,IDENT,Z3)}
+ GL.beams.forEach((m,i)=>{
+  const dx=m.b[0]-m.a[0],dy=m.b[1]-m.a[1],len=Math.hypot(dx,dy),ang=Math.atan2(dy,dx),al=m.read?.4:.85;
+  box(m.a[0],m.a[1],0,-1.5,106,len,3,3,CL.amber,al,3,rotZ(ang),Z3);
+  const u=(t*.7+i*.31)%1;
+  box(m.a[0]+dx*u,m.a[1]+dy*u,-6,-6,100,12,12,12,CL.pale,1,3,IDENT,Z3)});
+ gl.depthMask(true);
+ /* étiquettes HTML : projetées avec la même caméra */
+ const lod=z<.6?"far":z<1.05?"mid":"near";if(GL.lod!==lod){GL.lod=lod;GL.st.dataset.lod=lod}
+ const c={rz,rx:cam.rx,s:z,ox:cam.ox,oy:cam.oy},k=Math.max(.7,Math.min(1.5,z));
+ for(const d of GL.desks){
+  const l=GL.lab[d.id];if(l){const p=glProj(d.x,d.y,98,c);l.style.transform=`translate(${(p[0]-72).toFixed(1)}px,${(p[1]-34).toFixed(1)}px) scale(${k.toFixed(2)})`}
+  const zz=GL.zz[d.id];if(zz){const p=glProj(d.x,d.y+34,66,c);zz.style.transform=`translate(${p[0].toFixed(1)}px,${(p[1]-20).toFixed(1)}px)`}}
+ for(const r of GL.rooms){const t=GL.ttl[r.h];if(!t)continue;
+  const p=glProj(r.x+20,r.y,122,c);t.style.transform=`translate(${p[0].toFixed(1)}px,${(p[1]-30*k).toFixed(1)}px) scale(${k.toFixed(2)})`}}
+let rects={};
+/* dernier état connu gardé dans le navigateur : affiché dès l'ouverture, puis rafraîchi */
+function saveState(st){try{const c=Object.assign({},st,{messages:st.messages.map(m=>Object.assign({},m,{text:(m.text||"").slice(0,200)}))});
+ localStorage.setItem("av-state",JSON.stringify(c))}catch(e){}}
+function restoreState(){try{const c=localStorage.getItem("av-state");if(c){const st=JSON.parse(c);if(st&&st.agents){last=st;
+ document.getElementById("refresh").textContent="· dernier état connu, mise à jour…"}}}catch(e){}}
+let busy=false;  /* pas de requête empilée si le serveur est lent (machine chargée) */
+async function tick(){if(busy)return;busy=true;try{const r=await fetch("/api/state");const st=await r.json();last=st;draw(st);saveState(st);
+ document.getElementById("refresh").textContent=st.erreur?"· ⚠ collecte en échec : "+st.erreur+(st.cache_age!=null?" (état d'il y a "+ago(st.cache_age)+")":"")
+  :"· rafraîchi "+new Date().toLocaleTimeString()+(st.cache_age>10?" (données d'il y a "+ago(st.cache_age)+")":"")}catch(e){console.error(e);
+ document.getElementById("refresh").textContent=e&&e.name==="TypeError"&&/fetch|network/i.test(e.message)?"· serveur injoignable":"· erreur d'affichage (voir la console)"}finally{busy=false}}
+let COST=null;
+const fmN=n=>n>=1e9?(n/1e9).toFixed(2).replace(".",",")+" Md":n>=1e6?(n/1e6).toFixed(1).replace(".",",")+" M":n>=1e3?Math.round(n/1e3)+" k":String(n);
+const fmE=n=>Math.round(n).toLocaleString("fr-FR")+" €";
+function ctx(h){const e=COST&&COST.by&&COST.by[h];return e&&e.out?` · ${fmN(e.out)} sortie · ≈ ${fmE(e.eur)}`:""}
+function gratuit(c){/* objectif : le maximum sur les modèles locaux (gratuits) — part de la production, tous temps / 7 j / aujourd'hui */
+ if(c.burn&&c.burn.part){const p=c.burn.part,f=x=>x==null?"—":Math.round(x)+" %",col=x=>x==null?"var(--dim)":x>=60?"var(--act)":x>=35?"#f59e0b":"#ef4444";
+  return `<div class="sub" title="Source : agent-burn (période « ${esc(c.burn.periode)} », tokens cache compris). Détail : Conso &amp; quotas."><b>Part gratuite</b> (modèles locaux) : <b style="color:${col(p.periode)}">${f(p.periode)}</b> des tokens · 7 j <b style="color:${col(p.j7)}">${f(p.j7)}</b> · aujourd'hui <b style="color:${col(p.auj)}">${f(p.auj)}</b><br>
+   7 j payant ≈ ${Math.round(c.burn.payant_7j_usd)} $ · abonnement ≈ ${Math.round(c.burn.abonnement_7j_usd)} $ · coût évité ≈ ${Math.round(c.burn.evite_usd)} $ (équiv. API) · <a href="/conso" target="av-conso" style="color:inherit">détail →</a></div>`}
+ const g=c.moteurs.filter(e=>e.key==="local"||e.key==="strata"),pct=(a,b)=>b>0?Math.round(100*a/b):0;
+ const jour=(es,from)=>es.reduce((s,e)=>s+e.jours.slice(from).reduce((x,y)=>x+y,0),0),n=c.jours.length;
+ const all=pct(g.reduce((s,e)=>s+e.out,0),c.total.out),w7=pct(jour(g,n-7),jour(c.moteurs,n-7)),td=pct(jour(g,n-1),jour(c.moteurs,n-1));
+ const col=p=>p>=60?"var(--act)":p>=35?"#f59e0b":"#ef4444";
+ return `<div class="sub" title="Modèles locaux (local + second poste) : gratuits. Objectif : le maximum, surtout sur les tâches à leur hauteur.&#10;7 j et aujourd'hui : part de la valeur équivalent Opus produite."><b>Part gratuite</b> (modèles locaux) : <b style="color:${col(all)}">${all} %</b> des tokens · 7 j <b style="color:${col(w7)}">${w7} %</b> · aujourd'hui <b style="color:${col(td)}">${td} %</b></div>`}
+function drawCost(){const c=COST,b=document.getElementById("coutb");if(!c)return;
+ const col={local:"#22c55e",strata:"#a855f7",glm:"#f59e0b"},t=c.total,k=c.eur_par_usd;
+ const rows=c.moteurs.map(e=>`<tr title="${e.sess} sessions · ${e.first||"—"} → ${e.last||"—"}&#10;entrée ${fmN(e.inp)} · cache lu ${fmN(e.cr)}&#10;≈ ${Math.round(e.usd)} $ au tarif Opus">
+  <td><span class="swatch" style="background:${col[e.key]}"></span> ${e.name}</td><td class="n">${fmN(e.out)}</td><td class="n">≈ ${fmE(e.eur)}</td></tr>`).join("");
+ const max=Math.max(1,...c.jours.map((_,i)=>c.moteurs.reduce((s,e)=>s+e.jours[i],0))),W=280,H=40,bw=W/c.jours.length;
+ const bars=c.jours.map((j,i)=>{let y=H;return c.moteurs.map(e=>{const h=e.jours[i]/max*(H-2);y-=h;
+  return h>0?`<rect x="${(i*bw+1).toFixed(1)}" y="${y.toFixed(1)}" width="${(bw-2).toFixed(1)}" height="${h.toFixed(1)}" fill="${col[e.key]}"><title>${j} · ${e.name} ≈ ${fmE(e.jours[i]*k)}</title></rect>`:""}).join("")}).join("");
+ b.className="";b.innerHTML=`<table><tr style="color:var(--dim);font-size:11.5px"><td>moteur</td><td class="n">tokens sortie</td><td class="n">équiv. Opus</td></tr>${rows}
+  <tr class="tot"><td>Total</td><td class="n">${fmN(t.out)}</td><td class="n">≈ ${fmE(t.eur)}</td></tr></table>
+  ${gratuit(c)}
+  <svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none">${bars}</svg>
+  <div class="sub">14 derniers jours · aujourd'hui ≈ ${fmE(t.today_usd*k)} · 7 j ≈ ${fmE(t.d7_usd*k)}<br>
+  entrée ${fmN(t.inp)} · cache lu ${fmN(t.cr)} · tarif Opus ${c.tarif.in}/${c.tarif.out} $ par M, cache ${c.tarif.cr} $ · 1 $ = ${String(k).replace(".",",")} €</div>`}
+async function loadCosts(){try{const r=await fetch("/api/costs");const c=await r.json();if(c.error)return;
+ c.by={};for(const e of c.moteurs)c.by[e.key]=e;COST=c;drawCost()}catch(e){console.error(e)}}
+async function loadWt(){try{const r=await fetch("/api/worktrees");const w=await r.json();if(w.error)return;
+ const n=w.resume.jamais||0,b=document.getElementById("wtn");b.textContent=n;b.className="badge"+(n?" rouge":"");
+ document.getElementById("bwt").title=`Jamais poussés : ${n} · en retard : ${w.resume.retard} · modifs non commitées : ${w.resume.modifs}\nDétail dans une nouvelle fenêtre`}catch(e){console.error(e)}}
+document.getElementById("bln").addEventListener("click",e=>{e.preventDefault();window.open("/liens","av-liens","popup=yes,width=1240,height=860")});
+document.getElementById("bcs").addEventListener("click",e=>{e.preventDefault();window.open("/conso","av-conso","popup=yes,width=1240,height=900")});
+async function loadLn(){try{const r=await fetch("/api/liens");const l=await r.json();if(l.error)return;
+ const n=l.resume.alertes,b=document.getElementById("lnn");b.textContent=n;b.className="badge"+(n?" rouge":"")}catch(e){console.error(e)}}
+loadLn();setInterval(loadLn,15000);
+document.getElementById("bwt").addEventListener("click",e=>{e.preventDefault();window.open("/worktrees","av-worktrees","popup=yes,width=1240,height=860")});
+loadCosts();setInterval(loadCosts,60000);loadWt();setInterval(loadWt,30000);
+GL.on=glInit();restoreState();setMode(MODE);requestAnimationFrame(glFrame);tick();setInterval(tick,3000);
+window.addEventListener("resize",()=>{if(last)MODE==="2d"?drawLinks(last):draw3d(last)});
+</script></body></html>"""
+
+
+# ------------------------------------------------ coûts : tokens générés -> équivalent Opus --
+
+TARIF_OPUS = {"in": 5.0, "out": 25.0, "cw": 6.25, "cr": 0.50}      # $ par million de tokens (Opus 5.x)
+EUR_PAR_USD = float(os.environ.get("AV_EUR_PAR_USD", "0.892"))
+MOTEURS = {k.lower(): v for k, v in CONF["modeles"].items()}      # modèle journalisé -> pièce : configuration locale
+NOMS_MOTEURS = dict(CONF["noms_moteurs"])
+
+
+def moteur_de_modele(m):
+    """Pièce d'un modèle journalisé : table locale, sinon tout glm-* est GLM ; None = moteur payant (non compté ici)."""
+    m = (m or "").lower()
+    return MOTEURS.get(m) or ("glm" if m.startswith("glm") and "glm" in NOMS_MOTEURS else None)
+COSTS_JSONL = HOME / ".claude" / "metrics" / "costs.jsonl"          # Claude Code : cumul par session
+CODEX_SESSIONS = HOME / ".codex" / "sessions"                       # Codex : total_token_usage cumulé
+COUTS_DEPUIS = os.environ.get("AV_COUTS_DEPUIS", "2026-09-01")      # les rollouts plus anciens sont ignorés
+_FICHIERS_CODEX = {}        # chemin -> (mtime_ns, taille, {(moteur, jour): [in, out, cw, cr]})
+
+
+def jour_local(ts):
+    try:
+        return datetime.fromisoformat(ts.replace("Z", "+00:00")).astimezone().strftime("%Y-%m-%d")
+    except Exception:
+        return ts[:10]
+
+
+def _delta(cur, prev):
+    return [max(0, c - p) for c, p in zip(cur, prev)]
+
+
+def _lire_rollout(path):
+    """{(moteur, jour): [entrée hors cache, sortie, écriture cache, lecture cache]} d'un rollout Codex.
+    input_tokens y contient le cache lu : on le retranche. Modèle non suivi dès le 1er tour : fichier ignoré."""
+    jours, prev, moteur, vu_tour = {}, [0, 0, 0, 0], None, False
+    with open(path, encoding="utf8", errors="replace") as f:
+        for l in f:
+            if '"turn_context"' in l:
+                try:
+                    o = json.loads(l)
+                except ValueError:
+                    continue
+                m = (o.get("payload") or {}).get("model")
+                if m:
+                    moteur, vu_tour = moteur_de_modele(m), True
+                if moteur is None:
+                    return {}                      # gpt-*, etc. : rien à compter ici
+            elif moteur and '"token_count"' in l:
+                try:
+                    o = json.loads(l)
+                except ValueError:
+                    continue
+                p = o.get("payload") or {}
+                u = (p.get("info") or {}).get("total_token_usage")
+                if p.get("type") != "token_count" or not u:
+                    continue
+                c = u.get("cached_input_tokens", 0)
+                cur = [u.get("input_tokens", 0) - c, u.get("output_tokens", 0), 0, c]
+                d = _delta(cur, prev)
+                prev = [max(a, b) for a, b in zip(cur, prev)]
+                if any(d):
+                    t = jours.setdefault((moteur, jour_local(o.get("timestamp", ""))), [0, 0, 0, 0])
+                    for i in range(4):
+                        t[i] += d[i]
+    return jours if vu_tour else {}
+
+
+def collect_costs():
+    from datetime import timedelta
+    jours, sessions = {}, {k: set() for k in NOMS_MOTEURS}
+
+    def ajoute(moteur, jour, d):
+        t = jours.setdefault((moteur, jour), [0, 0, 0, 0])
+        for i in range(4):
+            t[i] += d[i]
+
+    # Claude Code : lignes cumulées par session -> on ajoute les écarts, au jour de chaque ligne
+    prev = {}
+    try:
+        for l in COSTS_JSONL.read_text(errors="replace").splitlines():
+            try:
+                r = json.loads(l)
+            except ValueError:
+                continue
+            m = moteur_de_modele(r.get("model"))
+            if not m:
+                continue
+            cur = [r.get("input_tokens", 0), r.get("output_tokens", 0), r.get("cache_write_tokens", 0), r.get("cache_read_tokens", 0)]
+            sid = r.get("session_id", "")
+            avant = prev.get(sid, [0, 0, 0, 0])
+            d = _delta(cur, avant)
+            prev[sid] = [max(a, b) for a, b in zip(cur, avant)]
+            if any(d):
+                ajoute(m, jour_local(r.get("timestamp", "")), d)
+            sessions[m].add("cc-" + sid)
+    except OSError:
+        pass
+    # Codex : un cache par fichier (mtime + taille), seuls les rollouts modifiés sont relus
+    if CODEX_SESSIONS.is_dir():
+        for p in CODEX_SESSIONS.glob("*/*/*/rollout-*.jsonl"):
+            if p.name[8:18] < COUTS_DEPUIS:
+                continue
+            try:
+                st = p.stat()
+            except OSError:
+                continue
+            k = str(p)
+            c = _FICHIERS_CODEX.get(k)
+            if not c or c[0] != st.st_mtime_ns or c[1] != st.st_size:
+                try:
+                    c = (st.st_mtime_ns, st.st_size, _lire_rollout(p))
+                except OSError:
+                    continue
+                _FICHIERS_CODEX[k] = c
+            for (m, j), d in c[2].items():
+                ajoute(m, j, d)
+                sessions[m].add("cx-" + k)
+
+    def usd(t):
+        return (t[0] * TARIF_OPUS["in"] + t[1] * TARIF_OPUS["out"] + t[2] * TARIF_OPUS["cw"] + t[3] * TARIF_OPUS["cr"]) / 1e6
+
+    aujourdhui = datetime.now().date()
+    liste_jours = [(aujourdhui - timedelta(days=i)).strftime("%Y-%m-%d") for i in range(13, -1, -1)]
+    moteurs, tot = [], dict(sess=0, inp=0, out=0, cw=0, cr=0, usd=0.0, today_usd=0.0, d7_usd=0.0)
+    for cle, nom in NOMS_MOTEURS.items():
+        t = [0, 0, 0, 0]
+        mes = {j: v for (m, j), v in jours.items() if m == cle}
+        for v in mes.values():
+            for i in range(4):
+                t[i] += v[i]
+        e = {"key": cle, "name": nom, "sess": len(sessions[cle]), "inp": t[0], "out": t[1], "cw": t[2], "cr": t[3],
+             "usd": usd(t), "today_usd": usd(mes.get(liste_jours[-1], [0, 0, 0, 0])),
+             "d7_usd": sum(usd(mes.get(j, [0, 0, 0, 0])) for j in liste_jours[-7:]),
+             "first": min(mes) if mes else None, "last": max(mes) if mes else None,
+             "jours": [round(usd(mes.get(j, [0, 0, 0, 0])), 2) for j in liste_jours]}
+        e["eur"] = e["usd"] * EUR_PAR_USD
+        moteurs.append(e)
+        for k in ("sess", "inp", "out", "cw", "cr", "usd", "today_usd", "d7_usd"):
+            tot[k] += e[k]
+    tot["eur"] = tot["usd"] * EUR_PAR_USD
+    return {"t": int(time.time()), "tarif": TARIF_OPUS, "eur_par_usd": EUR_PAR_USD, "jours": liste_jours,
+            "moteurs": moteurs, "total": tot}
+
+
+# ------------------------------------------ worktrees : ce qui n'a jamais été poussé --
+
+WT_ORDRE = {"jamais": 0, "retard": 1, "modifs": 2, "sansdistant": 3, "absent": 4, "ok": 5}
+
+
+def registre_agents():
+    out, d = [], BUS / "agents"
+    if d.is_dir():
+        for f in sorted(d.iterdir()):
+            if ".tmp." in f.name or f.name.endswith(".tmp") or not f.is_file():
+                continue                     # inscription en cours d'écriture (tmp puis mv) : pas un agent
+            reg = {}
+            try:
+                for line in lire(f).splitlines():
+                    if "=" in line:
+                        k, _, v = line.partition("=")
+                        reg[k] = v
+            except OSError:
+                continue
+            reg["__id"] = f.name
+            out.append(reg)
+    return out
+
+
+def _git(path, *args, timeout=20):
+    try:
+        r = subprocess.run(["git", "-C", str(path), *args], capture_output=True, text=True, timeout=timeout)
+        return r.stdout if r.returncode == 0 else None
+    except Exception:
+        return None
+
+
+def depots_suivis(regs, only=None):
+    """git-common-dir -> un dossier de travail du dépôt : dépôts des worktrees du registre, racines_depots/*, AV_REPOS
+    (ou seulement `only`, liste de dossiers : mgr-scan ne regarde que le dépôt du manager)."""
+    if only:
+        cands = list(only)
+    else:
+        cands = [r.get("worktree", "") for r in regs]
+        for racine in CONF["racines_depots"]:
+            cands += [str(p) for p in Path(os.path.expanduser(racine)).glob("*")]
+        cands += [x for x in os.environ.get("AV_REPOS", "").split(":") if x]
+    depots = {}
+    for c in cands:
+        if c and os.path.isdir(c):
+            g = _git(c, "rev-parse", "--path-format=absolute", "--git-common-dir", timeout=5)
+            if g and g.strip():
+                depots.setdefault(g.strip(), c)
+    return depots
+
+
+def _inspecter(depot, work, b, agents_wt, remotes, base, branches):
+    path = b.get("worktree", "")
+    sha = b.get("HEAD", "")
+    branche = b["branch"].replace("refs/heads/", "") if "branch" in b else None
+    upstream, track = branches.get(branche, ("", "")) if branche else ("", "")
+    it = {"depot": depot, "chemin": path, "court": os.path.basename(path.rstrip("/")) or path, "branche": branche,
+          "detache": branche is None, "sha": sha[:9], "upstream": upstream, "track": track, "non_pousses": 0,
+          "vs_base": None, "dirty": 0, "dernier_ts": None, "dernier_msg": "", "agents": [], "agent_vivant": False}
+    ags = agents_wt.get(os.path.realpath(path), [])
+    it["agents"] = [a["__id"] for a in ags]
+    it["agent_vivant"] = any(reg_alive(a) for a in ags)
+    if not os.path.isdir(path):
+        it["statut"], it["commande"] = "absent", f"git -C {work} worktree prune"
+        return it
+    it["remote"] = bool(branche and (f"origin/{branche}" in remotes or (upstream and upstream in remotes)))
+    n = _git(path, "rev-list", "--count", sha, "--not", "--remotes")
+    it["non_pousses"] = int(n) if n and n.strip().isdigit() else 0
+    if base:
+        n = _git(path, "rev-list", "--count", f"{base}..{sha}")
+        it["vs_base"] = int(n) if n and n.strip().isdigit() else None
+    s = _git(path, "status", "--porcelain", timeout=40)
+    it["dirty"] = len([l for l in (s or "").splitlines() if l.strip()])
+    lg = _git(path, "log", "-1", "--format=%ct%x09%s")
+    if lg and "\t" in lg:
+        ts, _, msg = lg.strip().partition("\t")
+        it["dernier_ts"], it["dernier_msg"] = int(ts) if ts.isdigit() else None, msg[:140]
+    if not remotes:                          # dépôt sans aucun distant : « pousser » n'a pas de sens
+        it["statut"], it["commande"] = "sansdistant", f"git -C {path} remote add origin <url>"
+    elif it["non_pousses"] > 0 and not it["remote"]:
+        it["statut"] = "jamais"
+        it["commande"] = (f"git -C {path} push -u origin {branche}" if branche
+                          else f"git -C {path} switch -c <nom> && git -C {path} push -u origin <nom>")
+    elif it["non_pousses"] > 0:
+        it["statut"], it["commande"] = "retard", f"git -C {path} push"
+    elif it["dirty"] > 0:
+        it["statut"], it["commande"] = "modifs", f"git -C {path} status"
+    else:
+        it["statut"], it["commande"] = "ok", ""
+    return it
+
+
+def collect_worktrees(only=None):
+    from concurrent.futures import ThreadPoolExecutor
+    os.environ["GIT_OPTIONAL_LOCKS"] = "0"           # git status ne réécrit pas l'index des worktrees observés
+    regs = registre_agents()
+    agents_wt = {}
+    for r in regs:
+        agents_wt.setdefault(os.path.realpath(r.get("worktree", "")), []).append(r)
+    taches, depots_out = [], []
+    for gitdir, work in depots_suivis(regs, only).items():
+        porc = _git(work, "worktree", "list", "--porcelain", timeout=15) or ""
+        blocs, cur = [], {}
+        for line in porc.splitlines():
+            if not line.strip():
+                if cur:
+                    blocs.append(cur)
+                    cur = {}
+                continue
+            k, _, v = line.partition(" ")
+            cur[k] = v
+        if cur:
+            blocs.append(cur)
+        branches = {}
+        for l in (_git(work, "for-each-ref", "--format=%(refname:short)\t%(upstream:short)\t%(upstream:track)", "refs/heads") or "").splitlines():
+            p = l.split("\t")
+            if len(p) >= 3:
+                branches[p[0]] = (p[1], p[2])
+        remotes = set((_git(work, "for-each-ref", "--format=%(refname:short)", "refs/remotes") or "").split())
+        base = next((x for x in ("origin/main", "origin/master") if x in remotes), None)
+        nom = os.path.basename(os.path.dirname(gitdir)) if gitdir.endswith("/.git") else os.path.basename(gitdir)
+        depots_out.append({"nom": nom, "chemin": work, "base": base, "worktrees": len([b for b in blocs if "bare" not in b])})
+        for b in blocs:
+            if "bare" not in b:
+                taches.append((nom, work, b, agents_wt, remotes, base, branches))
+    with ThreadPoolExecutor(max_workers=6) as ex:
+        items = list(ex.map(lambda a: _inspecter(*a), taches))
+    items.sort(key=lambda i: (WT_ORDRE[i["statut"]], -(i["non_pousses"] + i["dirty"]), -(i["dernier_ts"] or 0)))
+    resume = {k: 0 for k in WT_ORDRE}
+    for i in items:
+        resume[i["statut"]] += 1
+    return {"t": int(time.time()), "resume": resume, "depots": depots_out, "items": items}
+
+
+class Cache:
+    """Calcul lent, relancé en arrière-plan quand il est plus vieux que `every` s ; le 1er appel attend."""
+
+    def __init__(self, fn, every):
+        self.fn, self.every, self.data, self.t = fn, every, None, 0.0
+        self.lock = threading.Lock()
+        self.busy = False
+
+    def _run(self):
+        if not self.lock.acquire(blocking=False):
+            return
+        self.busy = True
+        try:
+            self.data, self.t = self.fn(), time.time()
+        except Exception as e:
+            print("agent-view :", self.fn.__name__, "->", e, file=sys.stderr)
+        finally:
+            self.busy = False
+            self.lock.release()
+
+    def get(self):
+        if self.data is None:
+            self._run()
+            if self.data is None:               # un autre fil calcule déjà : on attend la fin
+                with self.lock:
+                    pass
+        elif time.time() - self.t > self.every and not self.busy:
+            threading.Thread(target=self._run, daemon=True).start()
+        if self.data is None:
+            return {"error": "indisponible"}
+        return dict(self.data, age=int(time.time() - self.t), refreshing=self.busy)
+
+
+COUTS = Cache(collect_costs, 60)
+WORKTREES = Cache(collect_worktrees, 30)
+
+
+# --- cache d'état (mode serve) : collect() est lent (find, lecture de transcripts) et la page l'interroge
+# toutes les 3 s. Un fil l'exécute en arrière-plan tant qu'une page est ouverte ; les requêtes lisent le cache.
+_CACHE = {"st": None, "t": 0.0, "req": 0.0, "err": ""}
+_CACHE_READY = threading.Event()
+CACHE_EVERY = 2.0      # secondes entre deux calculs
+CACHE_IDLE = 45.0      # sans requête depuis 45 s : on arrête de calculer
+
+
+def cache_loop():
+    while True:
+        if time.time() - _CACHE["req"] > CACHE_IDLE and _CACHE_READY.is_set():
+            time.sleep(1)
+            continue
+        try:
+            st = collect()
+            _CACHE["st"], _CACHE["t"], _CACHE["err"] = st, time.time(), ""
+            _CACHE_READY.set()
+        except Exception as e:                   # la page l'affiche : plus d'état figé en silence
+            _CACHE["err"] = f"{type(e).__name__}: {e}"[:300]
+            print("agent-view : collect ->", _CACHE["err"], file=sys.stderr)
+            if _CACHE["st"] is None:
+                _CACHE["st"], _CACHE["t"] = {"now": int(time.time()), "agents": [], "messages": [], "threads": [], "slots": {}}, time.time()
+                _CACHE_READY.set()
+        time.sleep(CACHE_EVERY)
+
+
+def cached_state():
+    """État courant depuis le cache, avec les durées (« il y a … ») ramenées à maintenant."""
+    _CACHE["req"] = time.time()
+    if not _CACHE_READY.wait(60):
+        return collect()
+    st, age = _CACHE["st"], int(time.time() - _CACHE["t"])
+    out = dict(st, now=int(time.time()), cache_age=age, erreur=_CACHE["err"])
+    out["agents"] = [dict(a, activity_ago=a["activity_ago"] + age) if a["activity_ago"] is not None else a for a in st["agents"]]
+    out["messages"] = [dict(m, ago=m["ago"] + age) for m in st["messages"]]
+    out["threads"] = [dict(t, ago=t["ago"] + age) for t in st["threads"]]
+    return out
+
+
+WT_PAGE = r"""<!doctype html><html lang="fr"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Worktrees — état des poussées</title>
+<style>
+:root{color-scheme:dark;--bg:#0e1118;--piece:#161a24;--line:#232838;--txt:#e6e9f2;--dim:#8089a0;
+ --jamais:#ef4444;--retard:#f59e0b;--modifs:#38bdf8;--sans:#a855f7;--ok:#22c55e}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--txt);font:14px/1.45 ui-sans-serif,system-ui,sans-serif}
+header{display:flex;justify-content:space-between;align-items:baseline;gap:12px;padding:14px 22px;border-bottom:1px solid var(--line);flex-wrap:wrap}
+header h1{font-size:17px;margin:0}#maj{color:var(--dim);font-size:12px}
+main{padding:16px 22px}
+#cards{display:flex;gap:12px;flex-wrap:wrap;margin-bottom:14px}
+.card{background:var(--piece);border:1px solid var(--line);border-radius:12px;padding:10px 16px;min-width:150px;cursor:pointer;
+ border-left:4px solid var(--c)}
+.card:hover{border-color:var(--c)}.card.on{box-shadow:0 0 0 2px var(--c)}
+.card b{font-size:26px;display:block;line-height:1.1}.card span{color:var(--dim);font-size:12px}
+#tools{display:flex;gap:12px;align-items:center;margin-bottom:12px;flex-wrap:wrap}
+#q{background:var(--piece);border:1px solid #2c3347;border-radius:8px;color:var(--txt);padding:6px 10px;font:inherit;min-width:260px}
+label{color:var(--dim);font-size:13px;display:flex;gap:6px;align-items:center}
+table{width:100%;border-collapse:collapse;background:var(--piece);border:1px solid var(--line);border-radius:12px;overflow:hidden}
+th{text-align:left;color:var(--dim);font-weight:500;font-size:12px;padding:8px 10px;border-bottom:1px solid var(--line);white-space:nowrap}
+td{padding:8px 10px;border-bottom:1px solid #1d2230;vertical-align:top;font-size:13px}
+tr:last-child td{border-bottom:0}
+.st{display:inline-block;padding:2px 9px;border-radius:999px;font-size:11.5px;font-weight:600;white-space:nowrap;
+ background:color-mix(in srgb,var(--c) 18%,transparent);color:var(--c);border:1px solid color-mix(in srgb,var(--c) 45%,transparent)}
+.mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px}
+.dim{color:var(--dim)}.num{text-align:right;white-space:nowrap}
+.wt{font-weight:600}.br{color:#9aa2b5;display:block}
+.ag{white-space:nowrap}.on{color:var(--ok)}
+button.cp{background:#1f2536;color:var(--txt);border:1px solid #2c3347;border-radius:6px;padding:2px 8px;font:inherit;font-size:12px;cursor:pointer}
+button.cp:hover{border-color:#4a5372}
+code{font-family:ui-monospace,monospace;font-size:11.5px;color:#b9bfcf;word-break:break-all}
+.vide{padding:28px;text-align:center;color:var(--dim)}
+footer{color:var(--dim);font-size:12px;margin-top:14px;line-height:1.6}
+</style></head><body>
+<header><h1>🌿 Worktrees — ce qui n'est pas poussé</h1><div id="maj">chargement…</div></header>
+<main>
+ <div id="cards"></div>
+ <div id="tools"><input id="q" type="search" placeholder="Filtrer : branche, worktree, agent, dépôt…">
+  <label><input id="cache" type="checkbox" checked> masquer les worktrees à jour</label></div>
+ <table><thead><tr><th>État</th><th>Dépôt</th><th>Worktree · branche</th><th class="num">Non poussés</th><th class="num">Hors main</th>
+  <th class="num">Modifs</th><th>Dernier commit</th><th>Agent</th><th>Commande</th></tr></thead><tbody id="rows"></tbody></table>
+ <footer><b>Jamais poussé</b> : la branche n'existe sur aucun distant et porte des commits que nul distant ne possède (perdus si le dossier saute).
+  <b>En retard</b> : branche poussée, mais des commits locaux manquent au distant. <b>Modifs</b> : fichiers modifiés ou non suivis, non commités.
+  <b>Sans distant</b> : dépôt sans <code>origin</code>. « Hors main » = commits absents d'<code>origin/main</code>.
+  Lecture seule : aucune commande n'est lancée d'ici, « copier » met la commande dans le presse-papiers.</footer>
+</main>
+<script>
+const ST={jamais:["Jamais poussé","var(--jamais)"],retard:["En retard","var(--retard)"],modifs:["Modifs non commitées","var(--modifs)"],
+ sansdistant:["Sans distant","var(--sans)"],absent:["Dossier absent","var(--dim)"],ok:["À jour","var(--ok)"]};
+let D=null,F="";
+const esc=s=>String(s==null?"":s).replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+function ago(ts){if(!ts)return"—";const s=Math.max(0,Math.floor(Date.now()/1000-ts));
+ if(s<3600)return Math.max(1,Math.floor(s/60))+" min";if(s<86400)return Math.floor(s/3600)+" h";return Math.floor(s/86400)+" j"}
+function copier(txt,b){const t=document.createElement("textarea");t.value=txt;t.style.cssText="position:fixed;opacity:0";
+ document.body.appendChild(t);t.select();let ok=false;try{ok=document.execCommand("copy")}catch(e){}t.remove();
+ if(!ok&&navigator.clipboard)navigator.clipboard.writeText(txt).catch(()=>{});
+ const o=b.textContent;b.textContent="copié ✓";setTimeout(()=>b.textContent=o,1200)}
+function render(){if(!D)return;const r=D.resume,rows=document.getElementById("rows");
+ const cards=[["jamais","Jamais poussés"],["retard","En retard"],["modifs","Modifs non commitées"],["sansdistant","Sans distant"],["ok","À jour"]];
+ document.getElementById("cards").innerHTML=cards.map(([k,l])=>`<div class="card${F===k?" on":""}" data-k="${k}" style="--c:${ST[k][1]}"><b>${r[k]||0}</b><span>${l}</span></div>`).join("");
+ document.querySelectorAll(".card").forEach(c=>c.onclick=()=>{F=F===c.dataset.k?"":c.dataset.k;render()});
+ const q=document.getElementById("q").value.toLowerCase(),cache=document.getElementById("cache").checked;
+ const list=D.items.filter(i=>{if(F&&i.statut!==F)return false;if(!F&&cache&&i.statut==="ok")return false;
+  return !q||[i.court,i.branche,i.depot,i.agents.join(" "),i.dernier_msg,i.chemin].join(" ").toLowerCase().includes(q)});
+ if(!list.length){rows.innerHTML=`<tr><td colspan="9" class="vide">${F||q?"Aucun worktree pour ce filtre.":"Tout est poussé et propre. 🎉"}</td></tr>`}
+ else rows.innerHTML=list.map(i=>{const [lab,col]=ST[i.statut];
+  const ag=i.agents.length?`<span class="ag ${i.agent_vivant?"on":"dim"}" title="${esc(i.agents.join("\n"))}">${i.agent_vivant?"● ":"· "}${esc(i.agents[0])}${i.agents.length>1?" +"+(i.agents.length-1):""}</span>`:'<span class="dim">—</span>';
+  return `<tr><td><span class="st" style="--c:${col}">${lab}</span></td><td class="dim">${esc(i.depot)}</td>
+  <td><span class="wt" title="${esc(i.chemin)}">${esc(i.court)}</span><span class="br mono">${i.detache?"(HEAD détachée) "+esc(i.sha):esc(i.branche)}${i.track?" "+esc(i.track):""}</span></td>
+  <td class="num" style="${i.non_pousses?"color:"+col+";font-weight:700":""}">${i.non_pousses||"·"}</td>
+  <td class="num dim">${i.vs_base==null?"—":i.vs_base||"·"}</td>
+  <td class="num" style="${i.dirty?"color:var(--modifs);font-weight:700":""}">${i.dirty||"·"}</td>
+  <td><span class="dim">il y a ${ago(i.dernier_ts)}</span><br>${esc(i.dernier_msg)}</td><td>${ag}</td>
+  <td>${i.commande?`<code>${esc(i.commande)}</code> <button class="cp" data-c="${esc(i.commande)}" type="button">copier</button>`:""}</td></tr>`}).join("");
+ rows.querySelectorAll("button.cp").forEach(b=>b.onclick=()=>copier(b.dataset.c,b));
+ const n=D.items.length;document.getElementById("maj").textContent=
+  `${n} worktrees · ${D.depots.length} dépôts · calculé il y a ${D.age}s${D.refreshing?" · mise à jour…":""}`;
+ document.title=(r.jamais?"("+r.jamais+") ":"")+"Worktrees — état des poussées"}
+async function charger(){try{const x=await fetch("/api/worktrees");const d=await x.json();
+  if(d.error){document.getElementById("maj").textContent="calcul indisponible";return}D=d;render()}
+ catch(e){document.getElementById("maj").textContent="serveur injoignable"}}
+document.getElementById("q").oninput=render;document.getElementById("cache").onchange=render;
+charger();setInterval(charger,20000);
+</script></body></html>
+"""
+
+
+# ------------------------------------------------ liens : hiérarchie, flux, attentes --
+
+SEUIL_LENT = 1800       # non lu depuis plus de 30 min chez un agent vivant : il ne lit pas
+SEUIL_BLOQUE = 1800     # développeur vivant en veille depuis plus de 30 min alors que son superviseur l'attend
+FENETRE_LAT = 48 * 3600  # délais de lecture : messages lus dans les 48 dernières heures
+LU_MAX_S = float(os.environ.get("AV_LU_JOURS", "7")) * 86400   # messages déjà lus plus vieux : ignorés (coût)
+_NOM_OK = re.compile(r"^[\w.#:@+\-]+$")
+HOTE_OK = re.compile(r"^(localhost|127\.\d+\.\d+\.\d+|10\.\d+\.\d+\.\d+|192\.168\.\d+\.\d+|172\.(1[6-9]|2\d|3[01])\.\d+\.\d+)$")
+
+
+def _registre():
+    regs = {}
+    d = BUS / "agents"
+    if d.is_dir():
+        for f in d.iterdir():
+            if ".tmp." in f.name or f.name.endswith(".tmp") or not f.is_file():
+                continue
+            try:
+                regs[f.name] = dict(l.split("=", 1) for l in lire(f).splitlines() if "=" in l)
+            except OSError:
+                continue
+    return regs
+
+
+def _vivant_reg(regs, i):
+    r = regs.get(i)
+    return bool(r) and reg_alive(r)
+
+
+def _entete(raw):
+    head, _, body = raw.partition("\n\n")
+    return dict(l.split("=", 1) for l in head.splitlines() if "=" in l), body
+
+
+def _scan_msgs(now, plein=False):
+    """Tous les messages du bus : non lus (inbox/<id>/*.msg) et lus (inbox/<id>/lu/*.msg).
+
+    Le délai de lecture est ctime − mtime : `mv` vers lu/ change le ctime, pas le mtime."""
+    root = BUS / "inbox"
+    out = []
+    if not root.is_dir():
+        return out
+    for f in list(root.glob("*/*.msg")) + list(root.glob("*/lu/*.msg")):
+        try:
+            st = f.stat()
+            if f.parent.name == "lu" and now - st.st_mtime > LU_MAX_S:
+                continue                     # messages lus anciens : hors statistiques (AV_LU_JOURS)
+            with open(f, errors="replace") as fh:
+                raw = fh.read(60000 if plein else 1500)
+        except OSError:
+            continue
+        champs, body = _entete(raw)
+        lu = f.parent.name == "lu"
+        inbox = f.parent.parent.name if lu else f.parent.name
+        classe = "classe_par" in champs
+        out.append({"key": inbox + "/" + ("lu/" if lu else "") + f.name, "from": champs.get("de", "?"), "to": inbox,
+                    "when": champs.get("quand", ""), "read": lu, "sent": st.st_mtime, "ago": int(now - st.st_mtime),
+                    "lat": int(st.st_ctime - st.st_mtime) if lu and not classe and st.st_ctime - st.st_mtime > 1 else None,
+                    "classe": classe,
+                    "text": body.strip() if plein else " ".join(body.split())[:160]})
+    return out
+
+
+def collect_liens():
+    """Qui dirige qui (parent du registre), flux par paire, qui attend quoi, et ce qui coince.
+
+    « Attend » est DÉRIVÉ, pas déclaré : un message non lu de A vers B fait attendre A sur B ;
+    un superviseur vivant attend ses développeurs vivants ; un développeur vivant dont le parent
+    n'est plus là n'est dirigé par personne."""
+    st = cached_state()
+    now = time.time()
+    by = {a["id"]: a for a in st["agents"]}
+    vivant = lambda i: bool(by.get(i) and by[i]["alive"])
+    msgs = _scan_msgs(now)
+    flux = {}
+    for m in msgs:
+        e = flux.setdefault((m["from"], m["to"]), {"from": m["from"], "to": m["to"], "n": 0, "unread": 0, "ago": None, "last": ""})
+        e["n"] += 1
+        e["unread"] += 0 if m["read"] else 1
+        if e["ago"] is None or m["ago"] < e["ago"]:
+            e["ago"], e["last"] = m["ago"], m["text"]
+    unread_in, unread_out, oldest, lat = {}, {}, {}, {}
+    for m in msgs:
+        if not m["read"]:
+            unread_in[m["to"]] = unread_in.get(m["to"], 0) + 1
+            unread_out[m["from"]] = unread_out.get(m["from"], 0) + 1
+            oldest[m["to"]] = max(oldest.get(m["to"], 0), m["ago"])
+        elif m["lat"] is not None and m["ago"] - m["lat"] < FENETRE_LAT:
+            lat.setdefault(m["to"], []).append(m["lat"])
+    ids = set(by)
+    for m in msgs:
+        ids.add(m["from"]); ids.add(m["to"])
+    for a in st["agents"]:
+        if a["parent"]:
+            ids.add(a["parent"])
+    nodes = []
+    for i in sorted(ids):
+        a = by.get(i)
+        l = lat.get(i)
+        nodes.append({"id": i, "known": a is not None,
+                      "role": (a or {}).get("role") or ("mgr" if i.startswith("mgr") else "sup" if i.startswith("sup") else "dev" if i.startswith("dev") else "?"),
+                      "harness": (a or {}).get("harness", "?"), "state": (a or {}).get("state", "absent"),
+                      "classe": (a or {}).get("classe", "mgr" if i.startswith("mgr") else "sup" if i.startswith("sup") else "dev"),
+                      "parent": (a or {}).get("parent", ""), "wt": (a or {}).get("wt_short", ""),
+                      "activity_ago": (a or {}).get("activity_ago"),
+                      "unread_in": unread_in.get(i, 0), "unread_out": unread_out.get(i, 0),
+                      "oldest_unread": oldest.get(i), "lat_med": int(statistics.median(l)) if l else None, "lat_n": len(l or [])})
+    waits = []
+    for m in msgs:
+        if not m["read"] and vivant(m["to"]) and (vivant(m["from"]) or m["from"].startswith("sup")):
+            waits.append({"kind": "non_lu", "who": m["from"], "on": m["to"], "ago": m["ago"], "text": m["text"]})
+    kids = {}
+    for a in st["agents"]:
+        if a["parent"] and a["alive"]:
+            kids.setdefault(a["parent"], []).append(a["id"])
+    for p, ks in kids.items():
+        if vivant(p):
+            waits.append({"kind": "equipe", "who": p, "on": ", ".join(sorted(ks)), "n": len(ks),
+                          "actifs": sum(1 for k in ks if by[k]["state"] == "action")})
+    for a in st["agents"]:
+        if a["alive"] and a["role"] == "dev" and not vivant(a["parent"]):
+            waits.append({"kind": "orphelin", "who": a["id"], "on": a["parent"] or "(aucun parent)"})
+    waits.sort(key=lambda w: ({"non_lu": 0, "orphelin": 1, "equipe": 2}[w["kind"]], w.get("ago", 0)))
+
+    cibles = sorted(a["id"] for a in st["agents"] if a["alive"] and a["role"] == "sup")
+    perdus, lents = {}, {}
+    for m in msgs:
+        if m["read"]:
+            continue
+        if not vivant(m["to"]):
+            g = perdus.setdefault(m["to"], {"to": m["to"], "n": 0, "oldest": 0, "froms": {}, "keys": []})
+        elif m["ago"] >= SEUIL_LENT:
+            g = lents.setdefault(m["to"], {"who": m["to"], "n": 0, "oldest": 0, "froms": {}, "keys": []})
+        else:
+            continue
+        g["n"] += 1
+        g["oldest"] = max(g["oldest"], m["ago"])
+        g["froms"][m["from"]] = g["froms"].get(m["from"], 0) + 1
+        g["keys"].append(m["key"])
+    liste_perdus = []
+    for g in perdus.values():
+        p = by.get(g["to"], {}).get("parent", "")
+        defaut = p if vivant(p) else next((by[s]["parent"] for s in g["froms"] if s in by and vivant(by[s]["parent"])), "")
+        liste_perdus.append({"to": g["to"], "n": g["n"], "oldest": g["oldest"], "keys": g["keys"], "defaut": defaut,
+                             "froms": sorted(g["froms"], key=lambda s: -g["froms"][s])[:5]})
+    liste_perdus.sort(key=lambda g: -g["n"])
+    liste_lents = []
+    for g in lents.values():
+        a = by.get(g["who"], {})
+        liste_lents.append({"who": g["who"], "n": g["n"], "oldest": g["oldest"], "state": a.get("state", "?"),
+                            "harness": a.get("harness", "?"), "idle": a.get("activity_ago"),
+                            "froms": sorted(g["froms"], key=lambda s: -g["froms"][s])[:5]})
+    liste_lents.sort(key=lambda g: -g["oldest"])
+    bloques = []
+    for a in st["agents"]:
+        if a["alive"] and a["role"] == "dev" and a["state"] == "veille" and (a["activity_ago"] or 0) > SEUIL_BLOQUE and vivant(a["parent"]):
+            bloques.append({"who": a["parent"], "on": a["id"], "idle": a["activity_ago"],
+                            "unread": unread_in.get(a["id"], 0), "oldest_unread": oldest.get(a["id"])})
+    bloques.sort(key=lambda b: -b["idle"])
+    delais = sorted(({"id": i, "med": int(statistics.median(v)), "max": max(v), "n": len(v),
+                      "state": by.get(i, {}).get("state", "absent")} for i, v in lat.items() if v),
+                    key=lambda x: -x["med"])[:12]
+    return {"now": int(now), "nodes": nodes, "flux": sorted(flux.values(), key=lambda e: (-e["unread"], e["ago"] or 0)),
+            "waits": waits, "nb_msgs": len(msgs), "perdus": liste_perdus, "lents": liste_lents, "bloques": bloques,
+            "delais": delais, "cibles": cibles,
+            "resume": {"perdus": sum(g["n"] for g in liste_perdus), "agents_perdus": len(liste_perdus),
+                       "lents": sum(g["n"] for g in liste_lents), "agents_lents": len(liste_lents),
+                       "bloques": len(bloques), "alertes": len(liste_perdus) + len(liste_lents) + len(bloques)}}
+
+
+LIENS = Cache(collect_liens, 5)
+
+
+def _entrees_fils(i, limite=15):
+    out = []
+    d = BUS / "threads"
+    if not d.is_dir():
+        return out
+    for f in d.glob("*.md"):
+        try:
+            txt = lire(f)
+        except OSError:
+            continue
+        for bloc in re.split(r"(?m)^### ", txt)[1:]:
+            tete, _, corps = bloc.partition("\n")
+            if tete.startswith(i + " "):
+                out.append({"thread": f.stem, "when": tete.split("—", 1)[-1].strip(), "text": corps.strip()[:1500]})
+    out.sort(key=lambda e: e["when"], reverse=True)
+    return out[:limite]
+
+
+def api_pair(a, b):
+    ms = [m for m in _scan_msgs(time.time(), plein=True) if (m["from"], m["to"]) in ((a, b), (b, a))]
+    ms.sort(key=lambda m: m["sent"])
+    return {"a": a, "b": b, "messages": ms[-60:]}
+
+
+def api_agent(i):
+    st = cached_state()
+    a = next((x for x in st["agents"] if x["id"] == i), None)
+    ms = _scan_msgs(time.time(), plein=True)
+    recus = sorted((m for m in ms if m["to"] == i), key=lambda m: (m["read"], -m["sent"]))[:30]
+    envoyes = sorted((m for m in ms if m["from"] == i), key=lambda m: -m["sent"])[:30]
+    return {"id": i, "agent": a, "recus": recus, "envoyes": envoyes, "fils": _entrees_fils(i),
+            "nb_recus": sum(1 for m in ms if m["to"] == i), "nb_envoyes": sum(1 for m in ms if m["from"] == i)}
+
+
+def api_thread(name):
+    if not _NOM_OK.match(name) or name in (".", ".."):
+        return {"error": "nom invalide"}
+    try:
+        return {"name": name, "text": lire(BUS / "threads" / (name + ".md"))[:60000]}
+    except OSError:
+        return {"error": "introuvable"}
+
+
+def _cle_ok(key):
+    parts = key.split("/")
+    if len(parts) not in (2, 3) or any(not _NOM_OK.match(p) or p in (".", "..") for p in parts):
+        return None
+    if len(parts) == 3 and parts[1] != "lu":
+        return None
+    return BUS / "inbox" / Path(*parts) if parts[-1].endswith(".msg") else None
+
+
+def action_bus(kind, keys, to=""):
+    """Réachemine (ou classe sans suite) des messages NON LUS dont le destinataire n'est plus vivant.
+
+    Seule écriture d'agent-view sur le bus. Le message d'origine est conservé dans lu/ (marqué
+    `classe_par`, donc hors des statistiques de délai) ; rien n'est supprimé."""
+    regs = _registre()
+    if kind == "reroute" and not _vivant_reg(regs, to):
+        return {"ok": 0, "erreurs": [f"destinataire « {to} » absent ou fini"]}
+    ok, erreurs, owners = 0, [], set()
+    stamp = time.strftime("%Y%m%dT%H%M%S")
+    for key in keys[:500]:
+        p = _cle_ok(key) if isinstance(key, str) else None
+        if p is None or p.parent.name == "lu" or not p.is_file():
+            erreurs.append(f"{key} : introuvable ou déjà lu")
+            continue
+        owner = p.parent.name
+        if _vivant_reg(regs, owner):
+            erreurs.append(f"{key} : {owner} est vivant, il le lira lui-même")
+            continue
+        try:
+            st0 = p.stat()
+            champs, body = _entete(lire(p))
+            if kind == "reroute":
+                d = BUS / "inbox" / to
+                d.mkdir(parents=True, exist_ok=True)
+                dst = d / f"{p.stem}-rr{random.randrange(10 ** 5)}.msg"
+                tmp = d / (dst.name + ".tmp")
+                tmp.write_text(f"de={champs.get('de', '?')}\nà={to}\nquand={champs.get('quand', '')}\n"
+                               f"réacheminé_de={owner}\nréacheminé_le={stamp}\n\n"
+                               f"(réacheminé par agent-view : adressé à {owner}, qui n'est plus actif)\n{body.strip()}\n")
+                os.replace(tmp, dst)
+            lu = p.parent / "lu"
+            lu.mkdir(exist_ok=True)
+            tete = "".join(f"{k}={v}\n" for k, v in champs.items()) + f"classe_par=agent-view\nclasse_le={stamp}\n"
+            (lu / p.name).write_text(f"{tete}\n{body.strip()}\n")
+            os.utime(lu / p.name, (st0.st_atime, st0.st_mtime))   # garde la date d'envoi (ordre, ancienneté)
+            p.unlink()
+            ok += 1
+            owners.add(owner)
+        except OSError as e:
+            erreurs.append(f"{key} : {e}")
+    try:
+        with open(BUS / "av-actions.log", "a") as lg:
+            lg.write(f"{stamp}\t{kind}\t{to or '-'}\t{ok}/{len(keys)}\t{','.join(sorted(owners))}\n")
+    except OSError:
+        pass
+    return {"ok": ok, "erreurs": erreurs[:20]}
+
+
+def render_liens(d):
+    out = []
+    kids = {}
+    for n in d["nodes"]:
+        kids.setdefault(n["parent"], []).append(n)
+    ids = {n["id"] for n in d["nodes"]}
+    racines = [n for n in d["nodes"] if not n["parent"] or n["parent"] not in ids]
+    out.append(f'{C["b"]}Qui dirige qui{C["0"]}')
+
+    def noeud(n, prof):
+        if n["state"] in ("fini", "absent") and not (n["unread_in"] or n["unread_out"]) and not kids.get(n["id"]):
+            return
+        col = C.get(n["state"], C["d"])
+        badge = (f' ✉ {n["unread_in"]} non lu(s)' if n["unread_in"] else "") + (f' ↗ {n["unread_out"]} en attente de lecture' if n["unread_out"] else "")
+        out.append(f'{"  " * prof}{col}{DOT.get(n["state"], "?")}{C["0"]} {n["id"]} {C["d"]}[{n["harness"]}, {n["state"]}]{badge}{C["0"]}')
+        for k in sorted(kids.get(n["id"], []), key=lambda x: x["id"]):
+            noeud(k, prof + 1)
+
+    for r in sorted(racines, key=lambda x: (x["role"] not in ("mgr", "sup"), x["role"] != "mgr", x["id"])):
+        if r["role"] in ("sup", "mgr") or kids.get(r["id"]):
+            noeud(r, 0)
+    sans = [r for r in racines if r["role"] not in ("sup", "mgr") and not kids.get(r["id"])
+            and (r["state"] not in ("fini", "absent") or r["unread_in"] or r["unread_out"])]
+    if sans:
+        out.append(f'{C["d"]}Sans superviseur déclaré{C["0"]}')
+        for r in sorted(sans, key=lambda x: x["id"]):
+            noeud(r, 1)
+    out.append("")
+    out.append(f'{C["b"]}À traiter{C["0"]}')
+    r = d["resume"]
+    if not r["alertes"]:
+        out.append("  rien")
+    for g in d["perdus"]:
+        out.append(f'  ✉ {g["n"]} message(s) pour {g["to"]} (fini), le plus ancien il y a {ago_txt(g["oldest"])}'
+                   + (f' → suggestion : {g["defaut"]}' if g["defaut"] else ""))
+    for g in d["lents"]:
+        out.append(f'  🐌 {g["who"]} ({g["state"]}) n\'a pas lu {g["n"]} message(s), le plus ancien il y a {ago_txt(g["oldest"])}')
+    for b in d["bloques"]:
+        out.append(f'  ⏸ {b["who"]} attend {b["on"]}, en veille depuis {ago_txt(b["idle"])}')
+    out.append("")
+    out.append(f'{C["b"]}Délai de lecture (médiane, 48 h){C["0"]}')
+    for e in d["delais"][:8]:
+        out.append(f'  {e["id"]}  {ago_txt(e["med"])}  (max {ago_txt(e["max"])}, {e["n"]} msg)')
+    out.append("")
+    out.append(f'{C["b"]}En attente{C["0"]}')
+    if not d["waits"]:
+        out.append("  rien")
+    for w in d["waits"]:
+        if w["kind"] == "non_lu":
+            out.append(f'  ✉ {w["who"]} attend {w["on"]} — il y a {ago_txt(w["ago"])}')
+        elif w["kind"] == "equipe":
+            out.append(f'  ⏳ {w["who"]} dirige {w["n"]} dév. vivant(s), dont {w["actifs"]} en action')
+        else:
+            out.append(f'  ⚠ {w["who"]} n\'est dirigé par personne de vivant (parent : {w["on"]})')
+    out.append("")
+    out.append(f'{C["b"]}Flux (de → à){C["0"]}')
+    for e in d["flux"][:25]:
+        out.append(f'  {e["from"]} → {e["to"]}  ×{e["n"]}' + (f'  {e["unread"]} non lu(s)' if e["unread"] else "") + f'  il y a {ago_txt(e["ago"] or 0)}')
+    return pur_lignes(out)
+
+
+def pur_lignes(lignes):
+    """Assemble des lignes de terminal : retire les caractères de contrôle venus des données (pas nos couleurs)."""
+    return "\n".join(re.sub(r"\x1b(?!\[[0-9;]*m)", "", re.sub(r"[\x00-\x08\x0b-\x1a\x1c-\x1f\x7f-\x9f]", "", l)) for l in lignes)
+
+
+LIENS_PAGE = r"""<!doctype html><html lang="fr"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Liens entre agents</title>
+<style>
+:root{color-scheme:dark;--bg:#0e1118;--piece:#161a24;--piece2:#1b2030;--line:#232838;--txt:#e6e9f2;--dim:#8089a0;
+ --action:#22c55e;--veille:#f59e0b;--fini:#6b7280;--absent:#ef4444;--warn:#f59e0b;--bad:#ef4444;--ok:#22c55e;--flux:#5b86c9}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--txt);font:14px/1.45 ui-sans-serif,system-ui,sans-serif}
+header{display:flex;justify-content:space-between;align-items:baseline;gap:12px;padding:14px 22px;border-bottom:1px solid var(--line);flex-wrap:wrap}
+header h1{font-size:17px;margin:0}#maj{color:var(--dim);font-size:12px}
+main{padding:16px 22px;display:grid;grid-template-columns:minmax(360px,1fr) minmax(420px,1.2fr);gap:18px;align-items:start}
+@media(max-width:1000px){main{grid-template-columns:1fr}}
+.full{grid-column:1/-1}
+section{background:var(--piece);border:1px solid var(--line);border-radius:12px;padding:12px 14px}
+section h2{font-size:13px;margin:0 0 8px;color:var(--dim);font-weight:600;text-transform:uppercase;letter-spacing:.04em}
+#tools{display:flex;gap:14px;align-items:center;flex-wrap:wrap}
+#q,select{background:var(--piece);border:1px solid #2c3347;border-radius:8px;color:var(--txt);padding:6px 10px;font:inherit}
+#q{min-width:240px}
+label{color:var(--dim);font-size:13px;display:flex;gap:6px;align-items:center}
+#alertes{display:flex;gap:12px;flex-wrap:wrap}
+.card{background:var(--piece);border:1px solid var(--line);border-left:4px solid var(--c);border-radius:12px;padding:8px 16px;min-width:170px;cursor:pointer;text-decoration:none;color:inherit}
+.card b{font-size:24px;display:block;line-height:1.1}.card span{color:var(--dim);font-size:12px}
+.dot{display:inline-block;width:9px;height:9px;border-radius:50%;background:var(--c);flex:none}
+.dot.action{box-shadow:0 0 8px var(--c)}
+ul.tree,ul.tree ul{list-style:none;margin:0;padding-left:20px;border-left:1px dashed #2c3347}
+ul.tree{padding-left:0;border:0}
+.n{display:flex;gap:8px;align-items:center;padding:3px 0;flex-wrap:wrap}
+.n .id{font-weight:600;cursor:pointer}.n .id:hover{text-decoration:underline}.n.sup .id{font-size:14.5px}
+.chip{font-size:11px;padding:1px 7px;border-radius:999px;border:1px solid #2c3347;color:var(--dim);white-space:nowrap}
+.chip.bad{color:var(--bad);border-color:color-mix(in srgb,var(--bad) 55%,transparent)}
+.chip.warn{color:var(--warn);border-color:color-mix(in srgb,var(--warn) 55%,transparent)}
+.dim{color:var(--dim)}.mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px}
+.warn{color:var(--warn)}.bad{color:var(--bad)}
+.w{padding:7px 0;border-bottom:1px solid #1d2230}.w:last-child{border:0}
+.w .t{font-size:11.5px;color:var(--dim)}
+.w .k{cursor:pointer}.w.non_lu .k{color:var(--warn)}.w.orphelin .k{color:var(--bad)}.w.equipe .k{color:var(--dim)}
+.todo{padding:9px 0;border-bottom:1px solid #1d2230}.todo:last-child{border:0}
+.todo .h{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+.todo .h .id{font-weight:600;cursor:pointer}
+.todo .act{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:6px}
+button{background:#1f2536;color:var(--txt);border:1px solid #2c3347;border-radius:6px;padding:3px 10px;font:inherit;font-size:12.5px;cursor:pointer}
+button:hover{border-color:#4a5372}button.arm{border-color:var(--warn);color:var(--warn)}
+h3{font-size:12px;color:var(--dim);margin:14px 0 4px;font-weight:600;text-transform:uppercase;letter-spacing:.04em}
+table{width:100%;border-collapse:collapse}
+th{text-align:left;color:var(--dim);font-weight:500;font-size:12px;padding:6px 8px;border-bottom:1px solid var(--line)}
+td{padding:6px 8px;border-bottom:1px solid #1d2230;font-size:13px;vertical-align:top}
+tr:last-child td{border:0}.num{text-align:right;white-space:nowrap}
+tr.cl{cursor:pointer}tr.cl:hover td{background:#1a2030}
+.vide{color:var(--dim);padding:10px 0}
+a{color:#8ab4ff}
+#gwrap{overflow:auto;max-height:72vh;border:1px solid var(--line);border-radius:8px;background:#11141d}
+#g{display:block}
+#g .nd{cursor:pointer}
+#g .nd rect{fill:var(--piece2);stroke:var(--c);stroke-width:1.5}
+#g .nd.head rect{fill:#222a40}
+#g .nd text{fill:var(--txt);font:11px ui-sans-serif,system-ui,sans-serif;pointer-events:none}
+#g .nd.head text{font-weight:700;font-size:11.5px}
+#g .nd.fini text{fill:#9aa2b5}
+#g .nd .bd{font-size:10px;font-weight:700}
+#g .colt{fill:var(--dim);font:11px ui-sans-serif,system-ui,sans-serif}
+#g .hier{stroke:#3a4259;stroke-width:1;stroke-dasharray:3 3;fill:none}
+#g .eg path.v{fill:none;stroke-width:var(--w);opacity:.62}
+#g .eg path.h{fill:none;stroke:transparent;stroke-width:12;cursor:pointer}
+#g .eg.n path.v{stroke:var(--flux)}#g .eg.u path.v{stroke:var(--warn);opacity:.85}#g .eg.l path.v{stroke:var(--bad);opacity:.9}
+#g.hov .eg{opacity:.08}#g.hov .eg.on{opacity:1}#g.hov .nd{opacity:.35}#g.hov .nd.on{opacity:1}
+.legend{display:flex;gap:16px;flex-wrap:wrap;font-size:12px;color:var(--dim);margin-top:8px}
+.legend i{display:inline-block;width:22px;height:0;border-top:3px solid var(--c);vertical-align:middle;margin-right:5px}
+#drawer{position:fixed;top:0;right:0;bottom:0;width:min(480px,100vw);background:#12151f;border-left:1px solid #2c3347;box-shadow:-12px 0 40px #0008;
+ transform:translateX(105%);transition:transform .18s;z-index:10;display:flex;flex-direction:column}
+#drawer.open{transform:none}
+#dh{display:flex;justify-content:space-between;align-items:flex-start;gap:10px;padding:14px 16px;border-bottom:1px solid var(--line)}
+#dh b{font-size:15px;word-break:break-all}#db{padding:6px 16px 24px;overflow:auto;flex:1}
+.m{border:1px solid var(--line);border-left:3px solid #2c3347;border-radius:8px;padding:7px 10px;margin:7px 0;background:var(--piece)}
+.m.nl{border-left-color:var(--warn)}
+.mh{display:flex;justify-content:space-between;gap:10px;font-size:11.5px;flex-wrap:wrap}
+.mt{white-space:pre-wrap;word-break:break-word;margin-top:5px;font-size:13px}
+.kv{display:grid;grid-template-columns:auto 1fr;gap:2px 12px;font-size:12.5px;margin:6px 0}.kv span:nth-child(odd){color:var(--dim)}
+#toast{position:fixed;left:50%;bottom:22px;transform:translateX(-50%);background:#232a3d;border:1px solid #3a4259;border-radius:8px;padding:8px 16px;display:none;z-index:20}
+</style></head><body>
+<header><h1>🔗 Liens entre agents — qui dirige, qui attend, qui parle à qui</h1><div id="maj">chargement…</div></header>
+<main>
+ <div id="tools" class="full"><input id="q" type="search" placeholder="Filtrer : agent, moteur…">
+  <label><input id="cache" type="checkbox" checked> masquer les agents finis sans message en attente</label>
+  <label>Flèches <select id="arr"><option value="unread">messages non lus</option><option value="recent">non lus + 3 dernières heures</option><option value="all">tous les échanges</option></select></label>
+  <a href="/">← vue bureaux</a></div>
+ <div id="alertes" class="full"></div>
+ <section class="full"><h2>Graphe — colonnes = superviseurs, flèches = messages</h2>
+  <div id="gwrap"><svg id="g" xmlns="http://www.w3.org/2000/svg"></svg></div>
+  <div class="legend"><span><i style="--c:var(--flux)"></i>échange lu</span><span><i style="--c:var(--warn)"></i>message non lu</span>
+   <span><i style="--c:var(--bad)"></i>non lu, destinataire fini</span><span>épaisseur = nombre de messages · survol : isoler · clic : contenu</span></div></section>
+ <section id="s-todo" class="full"><h2>À traiter</h2><div id="todo"></div></section>
+ <section><h2>Qui dirige qui</h2><div id="tree"></div></section>
+ <div>
+  <section style="margin-bottom:18px"><h2>En attente</h2><div id="waits"></div></section>
+  <section><h2>Flux de messages (de → à)</h2><div id="flux"></div></section>
+ </div>
+</main>
+<aside id="drawer"><div id="dh"><b id="dt"></b><button id="dx" type="button">Fermer ✕</button></div><div id="db"></div></aside>
+<div id="toast"></div>
+<script>
+const COL={action:"var(--action)",veille:"var(--veille)",fini:"var(--fini)",absent:"var(--absent)"};
+const KC={mgr:"#f8fafc",sup:"#facc15",dev:"#3b82f6",junior:"#fb7185"};
+const LAB={action:"en action",veille:"en veille",fini:"fini",absent:"hors registre"};
+let D=null,ARR="unread",arme=null;
+const $=id=>document.getElementById(id);
+const esc=s=>String(s==null?"":s).replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+function ago(s){if(s==null)return"—";if(s<60)return s+" s";if(s<3600)return Math.floor(s/60)+" min";if(s<86400)return Math.floor(s/3600)+" h "+String(Math.floor(s%3600/60)).padStart(2,"0");return Math.floor(s/86400)+" j"}
+function quand(w){const m=/^(\d{4})(\d\d)(\d\d)T(\d\d)(\d\d)/.exec(w||"");return m?`${m[3]}/${m[2]} ${m[4]}:${m[5]}`:esc(w)}
+function toast(t){const e=$("toast");e.textContent=t;e.style.display="block";clearTimeout(toast.t);toast.t=setTimeout(()=>e.style.display="none",3500)}
+const css=n=>({"--c":COL[n]||COL.fini});
+function sty(o){return Object.entries(o).map(([k,v])=>k+":"+v).join(";")}
+
+/* ---------- graphe ---------- */
+const BW=188,BH=26,GAP=6,CG=54,TOP=34,PADL=64,CHUNK=14;
+function graphe(garde,q){
+ const byId={};D.nodes.forEach(n=>byId[n.id]=n);
+ const E=D.flux.filter(e=>{
+  if(e.from===e.to)return false;
+  if(ARR==="unread"&&!e.unread)return false;
+  if(ARR==="recent"&&!e.unread&&!(e.ago!=null&&e.ago<10800))return false;
+  if(q&&!(e.from+" "+e.to).toLowerCase().includes(q))return false;
+  return byId[e.from]&&byId[e.to]});
+ const need=new Set();E.forEach(e=>{need.add(e.from);need.add(e.to)});
+ const vis=D.nodes.filter(n=>need.has(n.id)||garde(n));
+ const visIds=new Set(vis.map(n=>n.id)),pos={},cols=[];
+ const rank=n=>({action:0,veille:1,fini:2,absent:3}[n.state]??4);
+ const tri=(a,b)=>rank(a)-rank(b)||a.id.localeCompare(b.id);
+ const sups=D.nodes.filter(n=>n.role==="sup"||n.role==="mgr");
+ const rangee={};
+ sups.slice().sort(tri).forEach(s=>{
+  const items=D.nodes.filter(n=>n.parent===s.id&&n.role!=="sup"&&n.role!=="mgr"&&visIds.has(n.id)).sort(tri);
+  if(!visIds.has(s.id)&&!items.length)return;
+  cols.push({head:s,items});rangee[s.id]=1;items.forEach(n=>rangee[n.id]=1)});
+ const orph=vis.filter(n=>!rangee[n.id]).sort(tri);
+ for(let i=0;i<orph.length;i+=CHUNK)cols.push({head:null,items:orph.slice(i,i+CHUNK)});
+ let H=TOP+10;
+ cols.forEach((c,ci)=>{
+  const x=PADL+ci*(BW+CG);let y=TOP;c.x=x;
+  if(c.head){pos[c.head.id]={x,y,w:BW,col:ci,n:c.head,head:true};y+=BH+GAP+4}else{c.ty=y;y+=BH/2+GAP}
+  c.items.forEach(n=>{pos[n.id]={x:x+14,y,w:BW-14,col:ci,n};y+=BH+GAP});
+  c.bottom=y;H=Math.max(H,y)});
+ const W=PADL+Math.max(1,cols.length)*(BW+CG);
+ const o=[`<defs>${["n","u","l"].map(k=>`<marker id="ar-${k}" viewBox="0 0 8 8" refX="7" refY="4" markerUnits="userSpaceOnUse" markerWidth="10" markerHeight="10" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="${k==="n"?"#5b86c9":k==="u"?"#f59e0b":"#ef4444"}"/></marker>`).join("")}</defs>`];
+ cols.forEach(c=>{
+  if(!c.head)o.push(`<text class="colt" x="${c.x}" y="${c.ty}">Sans superviseur déclaré</text>`);
+  else if(c.items.length){const last=c.items[c.items.length-1],p=pos[last.id],hx=c.x+7;
+   o.push(`<path class="hier" d="M${hx},${pos[c.head.id].y+BH} V${p.y+BH/2}"/>`);
+   c.items.forEach(n=>{const q2=pos[n.id];o.push(`<path class="hier" d="M${hx},${q2.y+BH/2} H${q2.x}"/>`)})}});
+ E.forEach(e=>{
+  const a=pos[e.from],b=pos[e.to];if(!a||!b)return;
+  const perdu=e.unread>0&&byId[e.to]&&(byId[e.to].state==="fini"||byId[e.to].state==="absent");
+  const k=perdu?"l":e.unread>0?"u":"n";
+  const w=(1.2+Math.min(4,Math.log2(e.n+1))).toFixed(1);
+  const ay=a.y+BH/2,by=b.y+BH/2;let d;
+  if(a.col===b.col){const x=a.x,of=26+Math.min(40,Math.abs(ay-by)/6);d=`M${x},${ay} C${x-of},${ay} ${x-of},${by} ${x},${by}`}
+  else{const r=a.x<b.x,ax=r?a.x+a.w:a.x,bx=r?b.x:b.x+b.w,dx=Math.max(46,Math.abs(bx-ax)/2.4)*(r?1:-1);
+   d=`M${ax},${ay} C${ax+dx},${ay} ${bx-dx},${by} ${bx},${by}`}
+  o.push(`<g class="eg ${k}" data-f="${esc(e.from)}" data-t="${esc(e.to)}" style="--w:${w}"><path class="v" d="${d}" marker-end="url(#ar-${k})"/><path class="h" d="${d}"><title>${esc(e.from)} → ${esc(e.to)} · ${e.n} msg${e.unread?" · "+e.unread+" non lu(s)":""}</title></path></g>`)});
+ Object.values(pos).forEach(p=>{
+  const n=p.n,id=n.id;
+  const bl=(n.unread_in?String(n.unread_in).length+2:0)+(n.unread_out?String(n.unread_out).length+2:0)+(n.unread_in&&n.unread_out?1:0);
+  const mx=Math.max(8,Math.floor((p.w-22-bl*7)/(p.head?7.2:6.3))),t=id.length>mx?id.slice(0,mx-1)+"…":id;
+  const bd=[];if(n.unread_in)bd.push(`<tspan fill="#f59e0b">✉${n.unread_in}</tspan>`);if(n.unread_out)bd.push(`<tspan fill="#8ab4ff">↗${n.unread_out}</tspan>`);
+  o.push(`<g class="nd ${p.head?"head":""} ${n.state}" data-id="${esc(id)}" style="--c:${COL[n.state]||COL.fini}"><title>${esc(id)} — ${LAB[n.state]||n.state} · ${esc(n.harness)}</title>
+   <rect x="${p.x}" y="${p.y}" width="${p.w}" height="${BH}" rx="6"/><text x="${p.x+8}" y="${p.y+BH/2+4}" style="fill:${KC[n.classe]||"var(--txt)"}">${esc(t)}</text>
+   <text class="bd" x="${p.x+p.w-6}" y="${p.y+BH/2+4}" text-anchor="end">${bd.join(" ")}</text></g>`)});
+ const svg=$("g");svg.setAttribute("width",W);svg.setAttribute("height",H+20);svg.setAttribute("viewBox",`0 0 ${W} ${H+20}`);
+ svg.innerHTML=o.join("");
+ if(!vis.length)svg.innerHTML=`<text x="20" y="40" class="colt">Rien à afficher pour ce filtre.</text>`}
+$("g").addEventListener("mouseover",ev=>{const nd=ev.target.closest(".nd"),eg=ev.target.closest(".eg"),svg=$("g");
+ svg.querySelectorAll(".on").forEach(x=>x.classList.remove("on"));
+ let ids=null;
+ if(nd){ids=new Set([nd.dataset.id]);svg.querySelectorAll(".eg").forEach(e=>{if(e.dataset.f===nd.dataset.id||e.dataset.t===nd.dataset.id){e.classList.add("on");ids.add(e.dataset.f);ids.add(e.dataset.t)}})}
+ else if(eg){eg.classList.add("on");ids=new Set([eg.dataset.f,eg.dataset.t])}
+ if(ids){svg.classList.add("hov");svg.querySelectorAll(".nd").forEach(n=>{if(ids.has(n.dataset.id))n.classList.add("on")})}
+ else svg.classList.remove("hov")});
+$("g").addEventListener("mouseleave",()=>{$("g").classList.remove("hov");$("g").querySelectorAll(".on").forEach(x=>x.classList.remove("on"))});
+$("g").addEventListener("click",ev=>{const eg=ev.target.closest(".eg"),nd=ev.target.closest(".nd");
+ if(eg)ouvrirPaire(eg.dataset.f,eg.dataset.t);else if(nd)ouvrirAgent(nd.dataset.id)});
+
+/* ---------- tiroir : contenu ---------- */
+const msgHtml=m=>`<div class="m ${m.read?"":"nl"}"><div class="mh"><span class="mono">${esc(m.from)} → ${esc(m.to)}</span>
+ <span class="dim">${quand(m.when)}${m.read?"":" · <b class=\"warn\">non lu</b>"}${m.lat!=null?" · lu après "+ago(m.lat):""}${m.classe?" · classé par agent-view":""}</span></div><div class="mt">${esc(m.text)}</div></div>`;
+function ouvrirTiroir(titre,html){$("dt").textContent=titre;$("db").innerHTML=html;$("drawer").classList.add("open");$("db").scrollTop=0}
+$("dx").onclick=()=>$("drawer").classList.remove("open");
+document.addEventListener("keydown",e=>{if(e.key==="Escape")$("drawer").classList.remove("open")});
+async function ouvrirPaire(a,b){ouvrirTiroir(`${a} ⇄ ${b}`,'<div class="vide">chargement…</div>');
+ try{const r=await fetch(`/api/pair?a=${encodeURIComponent(a)}&b=${encodeURIComponent(b)}`);const d=await r.json();
+  ouvrirTiroir(`${a} ⇄ ${b}`,`<div class="dim">${d.messages.length} message(s), du plus ancien au plus récent</div>`+
+   (d.messages.map(msgHtml).join("")||'<div class="vide">Aucun message.</div>')+
+   `<h3>Agents</h3><button data-ag="${esc(a)}">${esc(a)}</button> <button data-ag="${esc(b)}">${esc(b)}</button>`)}
+ catch(e){$("db").innerHTML='<div class="vide">serveur injoignable</div>'}}
+async function ouvrirAgent(id){ouvrirTiroir(id,'<div class="vide">chargement…</div>');
+ try{const r=await fetch(`/api/agent?id=${encodeURIComponent(id)}`);const d=await r.json(),a=d.agent;
+  const n=D&&D.nodes.find(x=>x.id===id)||{};
+  let h="";
+  if(a)h+=`<div class="kv"><span>État</span><span><span class="dot ${a.state}" style="${sty(css(a.state))}"></span> ${LAB[a.state]||a.state}${a.activity_ago!=null?" · actif il y a "+ago(a.activity_ago):""}</span>
+   <span>Moteur</span><span>${esc(a.harness)} · ${esc(a.role)}</span><span>Worktree</span><span class="mono">${esc(a.worktree)}</span>
+   <span>Dirigé par</span><span>${a.parent?`<a href="#" data-ag="${esc(a.parent)}">${esc(a.parent)}</a>`:"—"}</span>
+   <span>Depuis</span><span>${quand(a.since)} · pid ${a.pid}</span>
+   <span>Lecture</span><span>${n.lat_med!=null?"médiane "+ago(n.lat_med)+" ("+n.lat_n+" msg, 48 h)":"—"}</span></div>`;
+  else h+=`<div class="dim">Agent absent du registre (destinataire ou expéditeur seulement).</div>`;
+  h+=`<h3>Reçus (${d.nb_recus}) — non lus d'abord</h3>`+(d.recus.map(msgHtml).join("")||'<div class="vide">aucun</div>');
+  h+=`<h3>Envoyés (${d.nb_envoyes})</h3>`+(d.envoyes.map(msgHtml).join("")||'<div class="vide">aucun</div>');
+  if(d.fils.length)h+=`<h3>Dans les fils</h3>`+d.fils.map(f=>`<div class="m"><div class="mh"><span class="mono">🧵 ${esc(f.thread)}</span><span class="dim">${esc(f.when)}</span></div><div class="mt">${esc(f.text)}</div></div>`).join("");
+  ouvrirTiroir(id,h)}catch(e){$("db").innerHTML='<div class="vide">serveur injoignable</div>'}}
+document.addEventListener("click",ev=>{const t=ev.target.closest("[data-ag]");if(t){ev.preventDefault();ouvrirAgent(t.dataset.ag)}
+ const p=ev.target.closest("[data-pair]");if(p){const [a,b]=p.dataset.pair.split("\u0001");ouvrirPaire(a,b)}});
+
+/* ---------- actions sur le bus (écriture, explicite, en 2 temps) ---------- */
+async function agir(url,body){
+ const r=await fetch(url,{method:"POST",headers:{"Content-Type":"application/json","X-AV-Action":"1"},body:JSON.stringify(body)});
+ const j=await r.json();
+ toast(`${j.ok} message(s) traité(s)`+(j.erreurs&&j.erreurs.length?` · ${j.erreurs.length} refusé(s) : ${j.erreurs[0]}`:""));
+ await charger()}
+document.addEventListener("click",ev=>{const b=ev.target.closest("button[data-act]");if(!b)return;
+ const g=D.perdus[+b.dataset.i];if(!g)return;
+ const kind=b.dataset.act,sel=document.querySelector(`select[data-i="${b.dataset.i}"]`),to=sel?sel.value:"";
+ if(kind==="reroute"&&!to){toast("Choisissez d'abord un superviseur vivant.");return}
+ const id=kind+g.to;
+ if(arme!==id){arme=id;document.querySelectorAll("button.arm").forEach(x=>x.classList.remove("arm"));b.classList.add("arm");
+  b.dataset.txt=b.textContent;b.textContent=kind==="reroute"?`Confirmer : ${g.n} → ${to}`:`Confirmer : classer ${g.n}`;
+  setTimeout(()=>{if(arme===id){arme=null;b.classList.remove("arm");b.textContent=b.dataset.txt}},5000);return}
+ arme=null;
+ agir(kind==="reroute"?"/api/reroute":"/api/archive",kind==="reroute"?{keys:g.keys,to}:{keys:g.keys})});
+
+/* ---------- rendu ---------- */
+function render(){if(!D)return;
+ const q=$("q").value.toLowerCase(),cache=$("cache").checked;ARR=$("arr").value;
+ const byId={},kids={};D.nodes.forEach(n=>{byId[n.id]=n});
+ D.nodes.forEach(n=>{(kids[n.parent]=kids[n.parent]||[]).push(n)});
+ const garde=n=>{
+  const utile=!cache||n.state!=="fini"&&n.state!=="absent"||n.unread_in||n.unread_out||(kids[n.id]||[]).some(garde);
+  const trouve=!q||(n.id+" "+n.harness+" "+n.wt).toLowerCase().includes(q)||(kids[n.id]||[]).some(garde);
+  return utile&&trouve};
+ const R=D.resume;
+ $("alertes").innerHTML=[
+  ["var(--bad)",R.perdus,"messages pour des agents finis",`${R.agents_perdus} destinataire(s) — à réacheminer ou classer`],
+  ["var(--warn)",R.lents,"non lus depuis plus de 30 min",`${R.agents_lents} agent(s) vivant(s) ne lisent pas`],
+  ["var(--veille)",R.bloques,"développeur(s) en veille attendus","par un superviseur vivant, depuis plus de 30 min"]]
+  .map(([c,n,l,s])=>`<a class="card" href="#s-todo" style="--c:${n?c:"var(--ok)"}"><b>${n}</b>${l}<br><span>${s}</span></a>`).join("");
+ graphe(garde,q);
+ const noeud=n=>{
+  if(!garde(n))return"";
+  const ks=(kids[n.id]||[]).slice().sort((a,b)=>a.id.localeCompare(b.id)).map(noeud).join("");
+  const chips=[`<span class="chip" style="color:${KC[n.classe]||"inherit"}">${n.classe==="mgr"?"manager":n.classe==="sup"?"superviseur":n.classe==="junior"?"dev junior":"dev"} · ${esc(n.harness)}</span>`,`<span class="chip">${LAB[n.state]||n.state}${n.activity_ago!=null&&n.state!=="absent"?" · "+ago(n.activity_ago):""}</span>`];
+  if(n.unread_in)chips.push(`<span class="chip warn" title="messages reçus et pas encore lus">✉ ${n.unread_in} à lire</span>`);
+  if(n.unread_out)chips.push(`<span class="chip warn" title="messages envoyés, pas encore lus par leur destinataire">↗ ${n.unread_out} envoyé(s), non lu(s)</span>`);
+  if(n.lat_med!=null)chips.push(`<span class="chip" title="délai médian de lecture, ${n.lat_n} messages sur 48 h">⏱ ${ago(n.lat_med)}</span>`);
+  if(!n.known)chips.push(`<span class="chip bad">absent du registre</span>`);
+  return `<li><div class="n ${n.role}"><span class="dot ${n.state}" style="${sty(css(n.state))}"></span><span class="id" data-ag="${esc(n.id)}" title="${esc(n.wt)}" style="color:${KC[n.classe]||"inherit"}">${esc(n.id)}</span>${chips.join("")}</div>${ks?`<ul>${ks}</ul>`:""}</li>`};
+ const racines=D.nodes.filter(n=>!n.parent||!byId[n.parent]).filter(n=>n.role==="sup"||n.role==="mgr"||(kids[n.id]||[]).length).sort((a,b)=>a.id.localeCompare(b.id));
+ const orph=D.nodes.filter(n=>(!n.parent||!byId[n.parent])&&n.role!=="sup"&&n.role!=="mgr"&&!(kids[n.id]||[]).length).filter(garde);
+ const t=racines.map(noeud).join("")+(orph.length?`<li><div class="n dim">Sans superviseur</div><ul>${orph.map(noeud).join("")}</ul></li>`:"");
+ $("tree").innerHTML=t?`<ul class="tree">${t}</ul>`:'<div class="vide">Aucun agent à afficher.</div>';
+ let T="";
+ if(D.perdus.length){T+=`<h3 style="margin-top:0">Messages pour des agents finis — personne ne les lira</h3>`;
+  T+=D.perdus.map((g,i)=>{
+   const def=g.defaut||(D.cibles.length===1?D.cibles[0]:"");
+   const opts=(def?"":'<option value="">— choisir un superviseur vivant —</option>')+D.cibles.map(c=>`<option value="${esc(c)}"${c===def?" selected":""}>${esc(c)}</option>`).join("");
+   return `<div class="todo"><div class="h"><span class="dot fini" style="--c:var(--fini)"></span><span class="id" data-ag="${esc(g.to)}">${esc(g.to)}</span>
+    <span class="chip bad">${g.n} non lu(s)</span><span class="chip">le plus ancien : ${ago(g.oldest)}</span>
+    <span class="dim">de : ${g.froms.map(esc).join(", ")}</span></div>
+    <div class="act">${D.cibles.length?`<select data-i="${i}">${opts}</select><button data-act="reroute" data-i="${i}" type="button">Réacheminer</button>`:'<span class="dim">aucun superviseur vivant à qui les confier</span>'}
+     <button data-act="archive" data-i="${i}" type="button" title="Marque les messages comme lus, sans les transmettre ; copie conservée dans lu/">Classer sans suite</button></div></div>`}).join("")}
+ if(D.lents.length){T+=`<h3>Vivants qui ne lisent pas (non lus depuis plus de 30 min)</h3>`+
+  D.lents.map(g=>`<div class="todo"><div class="h"><span class="dot ${g.state}" style="${sty(css(g.state))}"></span><span class="id" data-ag="${esc(g.who)}">${esc(g.who)}</span>
+   <span class="chip">${esc(g.harness)} · ${LAB[g.state]||g.state}</span><span class="chip warn">${g.n} non lu(s)</span><span class="chip">le plus ancien : ${ago(g.oldest)}</span>
+   <span class="dim">de : ${g.froms.map(esc).join(", ")}</span></div></div>`).join("")}
+ if(D.bloques.length){T+=`<h3>Superviseur en attente d'un développeur en veille</h3>`+
+  D.bloques.map(b=>`<div class="todo"><div class="h"><span class="id" data-ag="${esc(b.who)}">${esc(b.who)}</span><span class="dim">attend</span>
+   <span class="id" data-ag="${esc(b.on)}">${esc(b.on)}</span><span class="chip warn">en veille depuis ${ago(b.idle)}</span>
+   ${b.unread?`<span class="chip bad">${b.unread} message(s) non lu(s) chez lui, le plus ancien : ${ago(b.oldest_unread)}</span>`:`<span class="chip">sa boîte est vide</span>`}</div></div>`).join("")}
+ if(D.delais.length){T+=`<h3>Délai de lecture par destinataire (médiane sur 48 h)</h3><table><thead><tr><th>Agent</th><th>État</th><th class="num">Médiane</th><th class="num">Pire</th><th class="num">Messages</th></tr></thead><tbody>`+
+  D.delais.map(e=>`<tr class="cl" data-ag="${esc(e.id)}"><td class="mono">${esc(e.id)}</td><td><span class="dot ${e.state}" style="${sty(css(e.state))}"></span> ${LAB[e.state]||e.state}</td>
+   <td class="num" style="${e.med>1800?"color:var(--warn);font-weight:700":""}">${ago(e.med)}</td><td class="num dim">${ago(e.max)}</td><td class="num dim">${e.n}</td></tr>`).join("")+"</tbody></table>"}
+ $("todo").innerHTML=T||'<div class="vide">Rien à traiter : aucun message perdu, aucun agent vivant qui ne lit pas, aucun superviseur bloqué.</div>';
+ const W=D.waits.filter(w=>!q||JSON.stringify(w).toLowerCase().includes(q));
+ $("waits").innerHTML=W.length?W.map(w=>{
+  if(w.kind==="non_lu")return `<div class="w non_lu"><span class="k" data-pair="${esc(w.who)}\u0001${esc(w.on)}">✉ ${esc(w.who)} attend ${esc(w.on)}</span>
+    <div class="t">il y a ${ago(w.ago)}</div><div class="dim">${esc(w.text)}</div></div>`;
+  if(w.kind==="equipe")return `<div class="w equipe"><span class="k" data-ag="${esc(w.who)}">⏳ ${esc(w.who)} dirige ${w.n} dév. vivant(s)</span>
+    <div class="t">${w.actifs} en action · ${esc(w.on)}</div></div>`;
+  return `<div class="w orphelin"><span class="k" data-ag="${esc(w.who)}">⚠ ${esc(w.who)} : plus de directeur vivant</span><div class="t">parent : ${esc(w.on)}</div></div>`}).join("")
+  :'<div class="vide">Personne n\'attend rien.</div>';
+ const F=D.flux.filter(e=>!q||(e.from+" "+e.to).toLowerCase().includes(q)).slice(0,60);
+ $("flux").innerHTML=F.length?`<table><thead><tr><th>De</th><th>À</th><th class="num">Msgs</th><th class="num">Non lus</th><th class="num">Dernier</th></tr></thead><tbody>`+
+  F.map(e=>`<tr class="cl" data-pair="${esc(e.from)}\u0001${esc(e.to)}" title="${esc(e.last)}"><td class="mono">${esc(e.from)}</td><td class="mono">${esc(e.to)}</td><td class="num">${e.n}</td>
+   <td class="num" style="${e.unread?"color:var(--warn);font-weight:700":""}">${e.unread||"·"}</td><td class="num dim">${ago(e.ago)}</td></tr>`).join("")+"</tbody></table>"
+  :'<div class="vide">Aucun message.</div>';
+ const vivants=D.nodes.filter(n=>n.state==="action"||n.state==="veille").length;
+ $("maj").textContent=`${vivants} agents vivants · ${D.nb_msgs} messages · calculé il y a ${D.age}s`;
+ document.title=(R.alertes?"("+R.alertes+") ":"")+"Liens entre agents"}
+async function charger(){try{const x=await fetch("/api/liens");const d=await x.json();
+  if(d.error){$("maj").textContent="calcul indisponible";return}D=d;render()}
+ catch(e){$("maj").textContent="serveur injoignable"}}
+$("q").oninput=render;$("cache").onchange=render;$("arr").onchange=render;
+charger();setInterval(()=>{if(!arme)charger()},5000);
+</script></body></html>
+"""
+
+
+# ----------------------------------------- consommation & quotas : alimentées par agent-burn --
+# agent-burn lit les journaux locaux (Claude Code, Codex…) et calcule un coût équivalent API, la valeur des
+# abonnements et les limites 5 h / 7 j. Ses scans sont lents (dizaines de secondes sur un gros historique) : ils
+# tournent dans un fil d'arrière-plan, la page affiche la dernière donnée et son âge, jamais une attente.
+
+AB_CONF = CONF["agent_burn"]
+CLASSES = ["gratuit", "abonnement", "payant", "autre"]
+NOM_CLASSE = {"gratuit": "gratuit (modèles locaux)", "abonnement": "abonnement", "payant": "payant", "autre": "autre"}
+COULEUR_CLASSE = {"gratuit": "#22c55e", "abonnement": "#f59e0b", "payant": "#ec4899", "autre": "#8089a0"}
+_JETON = re.compile(r"(Bearer\s+|sk-[A-Za-z0-9-]*|ghp_)[A-Za-z0-9._\-]+")
+
+
+def binaire_burn():
+    b = os.environ.get("AV_AGENT_BURN") or os.path.expanduser(AB_CONF.get("binaire") or "~/.local/bin/agent-burn")
+    return b if os.path.isfile(b) and os.access(b, os.X_OK) else None
+
+
+def classe_modele(m):
+    """gratuit = modèle servi par un moteur local (table « modeles » : local / strata) ; sinon préfixes « classes »."""
+    ml = (m or "").lower()
+    if MOTEURS.get(ml) in ("local", "strata"):
+        return "gratuit"
+    for cl in ("abonnement", "payant"):
+        if any(ml.startswith(p.lower()) for p in CONF["classes"].get(cl, [])):
+            return cl
+    return "autre"
+
+
+def _burn(args, timeout, quota_only=False):
+    b = binaire_burn()
+    if not b:
+        raise RuntimeError("agent-burn introuvable ($AV_AGENT_BURN ou ~/.local/bin/agent-burn)")
+    cmd = [b, *args]
+    cfg = os.path.expanduser(AB_CONF.get("config") or "")
+    if cfg and os.path.isfile(cfg):
+        cmd += ["--config", cfg]
+    env = dict(os.environ, NO_COLOR="1")
+    if quota_only:
+        env["AGENT_BURN_QUOTA_ONLY"] = "1"
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, env=env, stdin=subprocess.DEVNULL)
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(f"agent-burn {' '.join(args[:2])} : plus de {timeout} s") from None
+    if r.returncode != 0:
+        msg = _JETON.sub(r"\1***", (r.stderr or r.stdout or "").strip())[-300:]
+        raise RuntimeError(f"agent-burn {' '.join(args[:2])} : code {r.returncode} {msg}")
+    return json.loads(r.stdout)
+
+
+def _reset_ms(fenetre, observe):
+    """Heure de remise à zéro d'une fenêtre de quota, déduite du temps écoulé (agent-burn n'en donne pas toujours)."""
+    try:
+        reste = (100.0 - float(fenetre["elapsedPercent"])) / 100.0 * float(fenetre["windowMinutes"]) * 60000
+        return int(observe + reste)
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def collect_quotas():
+    """Limites 5 h / 7 j de Claude et Codex (mode QUOTA_ONLY d'agent-burn : 1-2 s, sans scan des journaux)."""
+    out = {}
+    for agent in ("claude", "codex"):
+        try:
+            q = _burn(["harness", agent, "--json"], 60, quota_only=True)
+        except Exception as e:
+            out[agent] = {"erreur": str(e)}
+            continue
+        obs = q.get("observedAt") or int(time.time() * 1000)
+        fen = []
+        for cle, nom in (("sessionWindow", "5 h"), ("window", None)):
+            f = q.get(cle)
+            if not f:
+                continue
+            minutes = f.get("windowMinutes") or 0
+            fen.append({"nom": nom or ("7 j" if minutes == 10080 else f"{round(minutes / 1440)} j" if minutes >= 1440 else f"{minutes} min"),
+                        "utilise": f.get("usedPercent"), "ecoule": f.get("elapsedPercent"),
+                        "reset_ms": _reset_ms(f, obs)})
+        out[agent] = {"observe_ms": obs, "fenetres": fen}
+    out["glm"] = {"erreur": "quota GLM non exposé par agent-burn"}
+    return out
+
+
+def collect_conso():
+    periode = AB_CONF.get("periode") or "month"
+    s = _burn(["summary", periode, "--json", "--breakdown", "--value"], 900)
+    dm = s.get("dailyModels") or {}
+    modeles = [m.get("model", "") for m in dm.get("models", [])]
+    cl_mod = [classe_modele(m) for m in modeles]
+    jours = []
+    for d in (dm.get("history") or {}).get("days", []):
+        cout = {c: 0.0 for c in CLASSES}
+        tok = {c: 0 for c in CLASSES}
+        for i, c in enumerate(cl_mod):
+            cout[c] += (d.get("mc") or [0] * len(cl_mod))[i] or 0
+            tok[c] += (d.get("mt") or [0] * len(cl_mod))[i] or 0
+        jours.append({"d": d.get("d"), "cout": cout, "tokens": tok})
+    tot_tok = {c: sum(j["tokens"][c] for j in jours) for c in CLASSES}
+    tot_cout = {c: sum(j["cout"][c] for j in jours) for c in CLASSES}
+
+    def part(js):
+        t = sum(sum(j["tokens"].values()) for j in js)
+        return round(100.0 * sum(j["tokens"]["gratuit"] for j in js) / t, 1) if t else None
+
+    # coût évité : tokens gratuits valorisés au prix moyen du token payant sur la période (approximation affichée)
+    prix_moyen = tot_cout["payant"] / tot_tok["payant"] if tot_tok["payant"] else 0.0
+    top = sorted(({"modele": m.get("model"), "classe": classe_modele(m.get("model")), "cout": m.get("totalCost") or 0,
+                   "tokens": m.get("totalTokens") or 0} for m in s.get("models", [])), key=lambda x: -x["tokens"])[:15]
+    abonnements = []
+    for a in (s.get("subscription") or {}).get("agents", []):
+        est, fen, court = a.get("estimate") or {}, a.get("window") or {}, a.get("shortWindow") or {}
+        abonnements.append({"agent": a.get("agent"), "plan": a.get("plan"), "prix_mois": a.get("pricePerMonth"),
+                            "usage_periode": a.get("periodUsage"), "valeur_mois": est.get("monthlyValue"),
+                            "multiple": est.get("valueMultiple"), "fenetre": fen.get("label"), "fenetre_pct": fen.get("usedPercent"),
+                            "court": court.get("label"), "court_pct": court.get("usedPercent")})
+    compte = s.get("claudeAccount") or {}
+    resets = {"5 h": compte.get("sessionResetsAtMs"), "7 j": compte.get("weeklyResetsAtMs")}
+    return {"periode": periode, "jours": jours, "tot_tokens": tot_tok, "tot_cout": tot_cout,
+            "part_gratuite": {"periode": part(jours), "j7": part(jours[-7:]), "auj": part(jours[-1:])},
+            "evite_usd": round(tot_tok["gratuit"] * prix_moyen, 2), "prix_moyen_mtok": round(prix_moyen * 1e6, 4),
+            "total_usd": round((s.get("totals") or {}).get("totalCost") or 0, 2),
+            "top": top, "abonnements": abonnements, "resets_claude": resets,
+            "classes": [{"cle": c, "nom": NOM_CLASSE[c], "couleur": COULEUR_CLASSE[c]} for c in CLASSES]}
+
+
+class CacheFond:
+    """Calcul lent en arrière-plan ; get() n'attend JAMAIS : dernière donnée + âge, ou « en cours » au démarrage.
+    Après un échec, nouvel essai au plus tôt `pause` s plus tard (un binaire absent ne relance pas en boucle)."""
+
+    def __init__(self, fn, every, pause=120):
+        self.fn, self.every, self.pause = fn, every, pause
+        self.data, self.t, self.t_essai, self.err = None, 0.0, 0.0, ""
+        self.lock = threading.Lock()
+
+    def _run(self):
+        if not self.lock.acquire(blocking=False):
+            return
+        self.t_essai = time.time()
+        try:
+            self.data, self.t, self.err = self.fn(), time.time(), ""
+        except Exception as e:
+            self.err = str(e)[:400]
+        finally:
+            self.lock.release()
+
+    def get(self, attendre=False):
+        maintenant = time.time()
+        perime = self.data is None or maintenant - self.t > self.every
+        if perime and not self.lock.locked() and maintenant - self.t_essai > (self.pause if self.err else 0):
+            if attendre:
+                self._run()
+            else:
+                threading.Thread(target=self._run, daemon=True).start()
+        return {"data": self.data, "age": int(maintenant - self.t) if self.data is not None else None,
+                "calcul": self.lock.locked(), "erreur": self.err}
+
+
+CONSO = CacheFond(collect_conso, 600)
+QUOTAS = CacheFond(collect_quotas, 120)
+
+
+def api_conso():
+    return {"binaire": bool(binaire_burn()), "conso": CONSO.get(), "quotas": QUOTAS.get(),
+            "eur_par_usd": EUR_PAR_USD, "maintenant_ms": int(time.time() * 1000)}
+
+
+def resume_burn():
+    """Pour le panneau « Part gratuite » de la page principale : None tant qu'agent-burn n'a rien rendu."""
+    c = CONSO.get()["data"]
+    if not c:
+        return None
+    j7 = c["jours"][-7:]
+    return {"part": c["part_gratuite"], "payant_7j_usd": round(sum(j["cout"]["payant"] for j in j7), 2),
+            "abonnement_7j_usd": round(sum(j["cout"]["abonnement"] for j in j7), 2), "evite_usd": c["evite_usd"],
+            "periode": c["periode"]}
+
+
+def render_conso(api):
+    B, D, G, R = "\033[1m", "\033[2m", "\033[32m", "\033[0m"
+    lignes = [f"{B}CONSOMMATION & QUOTAS{R} {D}(agent-burn){R}"]
+    c, k = api["conso"], api["eur_par_usd"]
+    if not api["binaire"]:
+        return lignes[0] + "\n  agent-burn introuvable : $AV_AGENT_BURN ou ~/.local/bin/agent-burn (voir scripts/install.sh)"
+    if c["erreur"] and not c["data"]:
+        lignes.append(f"  indisponible : {c['erreur']}")
+    d = c["data"]
+    if d:
+        pg = d["part_gratuite"]
+        f = lambda x: "—" if x is None else f"{x:.0f} %"
+        lignes.append(f"  période « {d['periode']} » · total équivalent API {d['total_usd']:.0f} $ (≈ {d['total_usd'] * k:.0f} €)")
+        lignes.append(f"  {G}part gratuite{R} (tokens) : période {f(pg['periode'])} · 7 j {f(pg['j7'])} · aujourd'hui {f(pg['auj'])}"
+                      f" · coût évité ≈ {d['evite_usd']:.0f} $ {D}(au prix moyen du token payant){R}")
+        lignes.append(f"  {'jour':<11}" + "".join(f"{x:>13}" for x in ("gratuit Mtok", "abonnement $", "payant $")))
+        for j in d["jours"][-14:]:
+            lignes.append(f"  {j['d']:<11}{j['tokens']['gratuit'] / 1e6:>13.1f}{j['cout']['abonnement']:>13.2f}{j['cout']['payant']:>13.2f}")
+        lignes.append(f"  {B}top modèles{R}")
+        for m in d["top"][:10]:
+            lignes.append(f"    {m['modele'][:34]:<34} {m['classe']:<11} {m['tokens'] / 1e6:>10.1f} Mtok {m['cout']:>10.2f} $")
+        for a in d["abonnements"]:
+            v = f" · valeur ≈ {a['valeur_mois']:.0f} $/mois (×{a['multiple']:.1f})" if a.get("valeur_mois") else ""
+            prix = f" ({a['prix_mois']:.0f} $/mois)" if a.get("prix_mois") else ""
+            lignes.append(f"  abonnement {a['agent']} : {a['plan'] or '?'}{prix}{v}")
+        lignes.append(f"  {D}données d'il y a {c['age']} s{R}")
+    q = api["quotas"]["data"] or {}
+    for agent in ("claude", "codex", "glm"):
+        e = q.get(agent) or {}
+        if e.get("erreur"):
+            lignes.append(f"  limites {agent} : {e['erreur']}")
+            continue
+        for fn in e.get("fenetres", []):
+            r = fn.get("reset_ms")
+            quand = datetime.fromtimestamp(r / 1000).strftime("%d/%m %H:%M") if r else "?"
+            lignes.append(f"  limites {agent} {fn['nom']:<4} : {fn['utilise'] or 0:5.1f} % utilisé · remise à zéro {quand}")
+    return "\n".join(lignes)
+
+
+CONSO_PAGE = r"""<!doctype html><html lang="fr"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Conso & quotas — __TITRE__</title>
+<style>
+:root{color-scheme:dark;--bg:#0e1118;--piece:#161a24;--line:#232838;--txt:#e6e9f2;--dim:#8089a0;--ok:#22c55e;--warn:#f59e0b;--bad:#ef4444;--track:#232838}
+@media (prefers-color-scheme:light){:root{color-scheme:light;--bg:#f6f7fb;--piece:#ffffff;--line:#e2e6ef;--txt:#161a24;--dim:#5b6478;--track:#e8ebf2}}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--txt);font:14px/1.45 ui-sans-serif,system-ui,sans-serif}
+header{display:flex;justify-content:space-between;align-items:baseline;gap:12px;padding:14px 22px;border-bottom:1px solid var(--line);flex-wrap:wrap}
+header h1{font-size:17px;margin:0}header nav a{color:var(--dim);margin-left:14px;text-decoration:none}header nav a:hover{color:var(--txt)}
+#maj{color:var(--dim);font-size:12px}
+main{padding:16px 22px;display:grid;gap:14px;grid-template-columns:repeat(auto-fit,minmax(340px,1fr))}
+.panel{background:var(--piece);border:1px solid var(--line);border-radius:12px;padding:12px 16px;min-width:0}
+.panel.large{grid-column:1/-1}
+.panel h2{font-size:13px;color:var(--dim);font-weight:600;margin:0 0 10px;text-transform:uppercase;letter-spacing:.04em}
+#cards{display:flex;gap:12px;flex-wrap:wrap}
+.card{background:var(--piece);border:1px solid var(--line);border-left:4px solid var(--c);border-radius:12px;padding:10px 16px;min-width:170px}
+.card b{font-size:24px;display:block;line-height:1.15}.card span{color:var(--dim);font-size:12px}
+table{width:100%;border-collapse:collapse}th{text-align:left;color:var(--dim);font-weight:500;font-size:12px;padding:6px 8px;border-bottom:1px solid var(--line)}
+td{padding:6px 8px;border-bottom:1px solid var(--line);font-size:13px}tr:last-child td{border-bottom:0}
+.num{text-align:right;white-space:nowrap;font-variant-numeric:tabular-nums}.dim{color:var(--dim)}
+.chip{display:inline-block;padding:1px 8px;border-radius:999px;font-size:11.5px;font-weight:600;color:var(--c);
+ background:color-mix(in srgb,var(--c) 16%,transparent);border:1px solid color-mix(in srgb,var(--c) 45%,transparent)}
+.leg{display:flex;gap:14px;flex-wrap:wrap;font-size:12px;color:var(--dim);margin-top:6px}.leg i{display:inline-block;width:10px;height:10px;border-radius:3px;margin-right:5px;vertical-align:-1px}
+svg{width:100%;height:150px;display:block}
+.q{margin:8px 0 12px}.q .l{display:flex;justify-content:space-between;font-size:13px}.q .t{height:10px;background:var(--track);border-radius:999px;overflow:hidden;margin-top:4px;position:relative}
+.q .u{height:100%;border-radius:999px}.q .e{position:absolute;top:-2px;bottom:-2px;width:2px;background:var(--txt);opacity:.55}
+.err{color:var(--bad);font-size:12.5px}.vide{color:var(--dim);padding:10px 0}
+footer{grid-column:1/-1;color:var(--dim);font-size:12px;line-height:1.6}
+</style></head><body>
+<header><h1>📊 Conso & quotas</h1><nav><a href="/">← Bureaux</a><a href="/liens">Liens</a><a href="/worktrees">Worktrees</a></nav><div id="maj">chargement…</div></header>
+<main>
+ <div class="panel large"><div id="cards"></div></div>
+ <div class="panel large"><h2>Coût équivalent API par jour</h2><svg id="gcout" viewBox="0 0 700 150" preserveAspectRatio="none"></svg><div class="leg" id="lcout"></div></div>
+ <div class="panel large"><h2>Tokens par jour</h2><svg id="gtok" viewBox="0 0 700 150" preserveAspectRatio="none"></svg><div class="leg" id="ltok"></div></div>
+ <div class="panel"><h2>Limites d'abonnement</h2><div id="quotas"></div></div>
+ <div class="panel"><h2>Abonnements</h2><div id="abos"></div></div>
+ <div class="panel large"><h2>Top modèles</h2><div id="top"></div></div>
+ <footer id="pied"></footer>
+</main>
+<script>
+const $=id=>document.getElementById(id);
+const esc=s=>String(s==null?"":s).replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+const fmN=n=>n>=1e9?(n/1e9).toFixed(2).replace(".",",")+" Md":n>=1e6?(n/1e6).toFixed(1).replace(".",",")+" M":n>=1e3?Math.round(n/1e3)+" k":String(n||0);
+const fmU=n=>(n==null?"—":Math.round(n).toLocaleString("fr-FR")+" $");
+const pc=n=>n==null?"—":Math.round(n)+" %";
+function ago(s){if(s==null)return"—";if(s<90)return s+" s";if(s<5400)return Math.round(s/60)+" min";return Math.round(s/3600)+" h"}
+function quand(ms){if(!ms)return"?";const d=new Date(ms);return d.toLocaleDateString("fr-FR",{weekday:"short",day:"2-digit",month:"2-digit"})+" "+d.toLocaleTimeString("fr-FR",{hour:"2-digit",minute:"2-digit"})}
+function barres(svg,leg,jours,cl,champ,fmt){const W=700,H=150,n=jours.length;if(!n){$(svg).innerHTML="";return}
+ const tot=j=>cl.reduce((s,c)=>s+(j[champ][c.cle]||0),0),max=Math.max(1e-9,...jours.map(tot)),bw=W/n;
+ $(svg).innerHTML=jours.map((j,i)=>{let y=H;return cl.map(c=>{const v=j[champ][c.cle]||0,h=v/max*(H-4);y-=h;
+  return h>0?`<rect x="${(i*bw+1).toFixed(1)}" y="${y.toFixed(1)}" width="${Math.max(1,bw-2).toFixed(1)}" height="${h.toFixed(1)}" fill="${esc(c.couleur)}"><title>${esc(j.d)} · ${esc(c.nom)} : ${fmt(v)}</title></rect>`:""}).join("")}).join("");
+ $(leg).innerHTML=cl.map(c=>`<span><i style="background:${esc(c.couleur)}"></i>${esc(c.nom)}</span>`).join("")+`<span>max ${fmt(max)} / jour · ${n} jours</span>`}
+function render(A){const C=A.conso,D=C.data,Q=(A.quotas.data||{}),k=A.eur_par_usd;
+ const etat=[];if(!A.binaire)etat.push("agent-burn introuvable");if(C.calcul)etat.push("calcul en cours…");
+ if(D)etat.push("données d'il y a "+ago(C.age));$("maj").textContent=etat.join(" · ")||"en attente";
+ const errs=[C.erreur,A.quotas.erreur].filter(Boolean);
+ if(!D){$("cards").innerHTML=`<div class="vide">${A.binaire?(C.erreur?`<span class="err">indisponible : ${esc(C.erreur)}</span>`:"Premier calcul en cours (quelques dizaines de secondes sur un gros historique)…"):"agent-burn introuvable : définir AV_AGENT_BURN ou installer ~/.local/bin/agent-burn (scripts/install.sh)."}</div>`}
+ else{const pg=D.part_gratuite,col=p=>p==null?"var(--dim)":p>=60?"var(--ok)":p>=35?"var(--warn)":"var(--bad)";
+  const cards=[["var(--ok)",pc(pg.periode),"part gratuite (tokens, période)"],["var(--ok)",pc(pg.j7)+" · "+pc(pg.auj),"part gratuite 7 j · aujourd'hui"],
+   ["var(--ok)","≈ "+fmU(D.evite_usd),"coût évité (au prix moyen du token payant)"],["#ec4899",fmU(D.tot_cout.payant),"payant (équiv. API, période)"],
+   ["#f59e0b",fmU(D.tot_cout.abonnement),"abonnement (équiv. API, période)"],["var(--dim)",fmU(D.total_usd),"total ≈ "+Math.round(D.total_usd*k).toLocaleString("fr-FR")+" €"]];
+  $("cards").innerHTML=cards.map(([c,v,l],i)=>`<div class="card" style="--c:${c}"><b style="${i<2?"color:"+col(i?pg.j7:pg.periode):""}">${esc(v)}</b><span>${esc(l)}</span></div>`).join("");
+  barres("gcout","lcout",D.jours,D.classes.filter(c=>c.cle!=="gratuit"),"cout",fmU);
+  barres("gtok","ltok",D.jours,D.classes,"tokens",fmN);
+  const byc=Object.fromEntries(D.classes.map(c=>[c.cle,c]));
+  $("top").innerHTML=`<table><thead><tr><th>Modèle</th><th>Classe</th><th class="num">Tokens</th><th class="num">Coût équiv. API</th></tr></thead><tbody>`+
+   D.top.map(m=>`<tr><td>${esc(m.modele)}</td><td><span class="chip" style="--c:${esc((byc[m.classe]||{}).couleur||"#8089a0")}">${esc(m.classe)}</span></td><td class="num">${fmN(m.tokens)}</td><td class="num">${m.cout?fmU(m.cout):"0 $"}</td></tr>`).join("")+"</tbody></table>";
+  $("abos").innerHTML=D.abonnements.length?`<table><thead><tr><th>Outil</th><th>Formule</th><th class="num">Usage période</th><th class="num">Valeur / mois</th></tr></thead><tbody>`+
+   D.abonnements.map(a=>`<tr><td>${esc(a.agent)}</td><td>${esc(a.plan||"?")}${a.prix_mois?` <span class="dim">${esc(a.prix_mois)} $/mois</span>`:""}</td><td class="num">${fmU(a.usage_periode)}</td>
+    <td class="num">${a.valeur_mois?fmU(a.valeur_mois)+` <span class="dim">×${Number(a.multiple||0).toFixed(1).replace(".",",")}</span>`:"—"}</td></tr>`).join("")+"</tbody></table>":'<div class="vide">Aucun abonnement détecté.</div>'}
+ const rc=D?D.resets_claude:{};
+ $("quotas").innerHTML=["claude","codex","glm"].map(a=>{const e=Q[a]||{};if(!A.quotas.data)return"";
+  if(e.erreur)return `<div class="q"><div class="l"><b>${esc(a)}</b><span class="dim">${esc(e.erreur)}</span></div></div>`;
+  return (e.fenetres||[]).map(f=>{const u=Math.max(0,Math.min(100,f.utilise||0)),c=u>=90?"var(--bad)":u>=70?"var(--warn)":"var(--ok)";
+   const r=(a==="claude"&&rc&&rc[f.nom])||f.reset_ms;
+   return `<div class="q"><div class="l"><span><b>${esc(a)}</b> · ${esc(f.nom)}</span><span>${u.toFixed(0)} % · remise à zéro ${esc(quand(r))}</span></div>
+    <div class="t" title="trait : temps écoulé de la fenêtre (${Math.round(f.ecoule||0)} %)"><div class="u" style="width:${u}%;background:${c}"></div><div class="e" style="left:${Math.min(100,f.ecoule||0)}%"></div></div></div>`}).join("")}).join("")||'<div class="vide">Chargement des limites…</div>';
+ $("pied").innerHTML=`Source : <b>agent-burn</b> (journaux locaux ; coût = équivalent API, pas une facture). Classes : <b>gratuit</b> = modèles servis par un moteur local (table « modeles » de la configuration),
+  <b>abonnement</b> / <b>payant</b> = préfixes de modèle (« classes »). Les modèles locaux sont comptés à 0 par les <code>pricingOverrides</code> d'agent-burn.
+  Limites : rafraîchies toutes les 2 min ; consommation : toutes les 10 min.`+(errs.length?`<div class="err">${errs.map(esc).join(" · ")}</div>`:"")}
+async function charger(){try{const r=await fetch("/api/conso");render(await r.json())}catch(e){$("maj").textContent="serveur injoignable"}}
+charger();setInterval(charger,15000);
+</script></body></html>
+"""
+
+
+class Handler(BaseHTTPRequestHandler):
+    def log_message(self, *a):
+        pass
+
+    def _send(self, code, ctype, body, csp=None):
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Referrer-Policy", "no-referrer")
+        self.send_header("Cache-Control", "no-store")
+        if csp:
+            self.send_header("Content-Security-Policy", csp)
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _page(self, page):
+        """Page HTML avec CSP stricte : seuls nos <script> (nonce de la réponse) s'exécutent ; un gestionnaire
+        d'évènement injecté dans le DOM (onerror=…) est bloqué même si un échappement venait à manquer."""
+        nonce = secrets.token_urlsafe(18)
+        csp = (f"default-src 'none'; script-src 'nonce-{nonce}'; style-src 'unsafe-inline'; img-src 'self' data:; "
+               "connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'")
+        page = (page.replace("__TITRE__", html.escape(CONF["titre"]))
+                .replace("__PIECES_JSON__", json.dumps([list(p) for p in PIECES], ensure_ascii=False).replace("</", "<\\/")))
+        self._send(200, "text/html; charset=utf-8", page.replace("<script>", f'<script nonce="{nonce}">').encode(), csp)
+
+    def _hote_ok(self):
+        return bool(HOTE_OK.match(self.headers.get("Host", "").rsplit(":", 1)[0]))
+
+    def do_GET(self):
+        if not self._hote_ok():                 # anti DNS-rebinding : un nom de domaine étranger ne lit rien
+            return self._send(403, "text/plain", b"403")
+        u = urlparse(self.path)
+        q = {k: v[0] for k, v in parse_qs(u.query).items()}
+        if u.path == "/api/pair":
+            self._send(200, "application/json; charset=utf-8", json.dumps(api_pair(q.get("a", ""), q.get("b", "")), ensure_ascii=False).encode())
+        elif u.path == "/api/agent":
+            self._send(200, "application/json; charset=utf-8", json.dumps(api_agent(q.get("id", "")), ensure_ascii=False).encode())
+        elif u.path == "/api/thread":
+            self._send(200, "application/json; charset=utf-8", json.dumps(api_thread(q.get("name", "")), ensure_ascii=False).encode())
+        elif self.path == "/api/state":
+            st = cached_state()
+            st["me"] = os.environ.get("AGENT_ID", "")
+            self._send(200, "application/json; charset=utf-8", json.dumps(st, ensure_ascii=False).encode())
+        elif self.path == "/api/costs":
+            c = COUTS.get()
+            if "error" not in c:
+                c["burn"] = resume_burn()           # part gratuite d'après agent-burn quand il a rendu (sinon ancien calcul)
+            self._send(200, "application/json; charset=utf-8", json.dumps(c, ensure_ascii=False).encode())
+        elif self.path == "/api/conso":
+            self._send(200, "application/json; charset=utf-8", json.dumps(api_conso(), ensure_ascii=False).encode())
+        elif self.path in ("/conso", "/conso/"):
+            self._page(CONSO_PAGE)
+        elif self.path == "/api/worktrees":
+            self._send(200, "application/json; charset=utf-8", json.dumps(WORKTREES.get(), ensure_ascii=False).encode())
+        elif self.path == "/api/liens":
+            self._send(200, "application/json; charset=utf-8", json.dumps(LIENS.get(), ensure_ascii=False).encode())
+        elif self.path in ("/liens", "/liens/"):
+            self._page(LIENS_PAGE)
+        elif self.path in ("/worktrees", "/worktrees/"):
+            self._page(WT_PAGE)
+        elif self.path in ("/", "/index.html"):
+            self._page(PAGE)
+        else:
+            self._send(404, "text/plain", b"404")
+
+    def do_POST(self):
+        """Écritures sur le bus (réacheminer / classer des messages de destinataires finis).
+
+        Garde-fous : nom d'hôte privé (anti DNS-rebinding), en-tête X-AV-Action (impose un preflight
+        CORS que ce serveur ne satisfait jamais), JSON, Origin identique à Host."""
+        hote = self.headers.get("Host", "")
+        origine = self.headers.get("Origin", "")
+        if (not self._hote_ok() or self.headers.get("X-AV-Action") != "1"
+                or not self.headers.get("Content-Type", "").startswith("application/json")
+                or (origine and origine.split("://", 1)[-1] != hote)):
+            return self._send(403, "text/plain", b"403")
+        try:
+            n = int(self.headers.get("Content-Length", "0"))
+            data = json.loads(self.rfile.read(min(n, 200000)) or b"{}")
+            keys = data.get("keys")
+            if not isinstance(keys, list):
+                raise ValueError("keys")
+        except (ValueError, AttributeError):
+            return self._send(400, "text/plain", b"400")
+        if self.path == "/api/reroute":
+            res = action_bus("reroute", keys, str(data.get("to", "")))
+        elif self.path == "/api/archive":
+            res = action_bus("archive", keys)
+        else:
+            return self._send(404, "text/plain", b"404")
+        LIENS._run()
+        self._send(200, "application/json; charset=utf-8", json.dumps(res, ensure_ascii=False).encode())
+
+
+def fmt_tok(n):
+    return f"{n / 1e9:.2f} Md" if n >= 1e9 else f"{n / 1e6:.1f} M" if n >= 1e6 else f"{n / 1e3:.0f} k" if n >= 1e3 else str(n)
+
+
+def render_costs(c):
+    L = [f"{'moteur':22}{'sess':>6}{'sortie':>10}{'entrée':>10}{'cache lu':>11}{'$ Opus':>9}{'€ Opus':>9}{'auj. €':>8}{'7 j €':>8}"]
+    for e in c["moteurs"] + [dict(c["total"], name="TOTAL")]:
+        L.append(f"{e['name']:22}{e['sess']:6}{fmt_tok(e['out']):>10}{fmt_tok(e['inp']):>10}{fmt_tok(e['cr']):>11}"
+                 f"{e['usd']:9.0f}{e['eur']:9.0f}{e['today_usd'] * c['eur_par_usd']:8.0f}{e['d7_usd'] * c['eur_par_usd']:8.0f}")
+    t = c["tarif"]
+    L.append(f"tarif Opus : {t['in']}/{t['out']} $ par M (entrée/sortie), cache écrit {t['cw']}, lu {t['cr']} ; 1 $ = {c['eur_par_usd']} €")
+    return "\n".join(L)
+
+
+def render_worktrees(w, tout=False):
+    NOM = {"jamais": "JAMAIS POUSSÉ", "retard": "en retard", "modifs": "modifs", "sansdistant": "sans distant",
+           "absent": "absent", "ok": "à jour"}
+    L = ["  ".join(f"{NOM[k]} : {v}" for k, v in w["resume"].items())]
+    for i in w["items"]:
+        if i["statut"] == "ok" and not tout:
+            continue
+        L.append(f"{NOM[i['statut']]:15}{i['depot']:12}{i['court'][:36]:36} {str(i['branche'] or '(détachée)')[:34]:34}"
+                 f" non poussés={i['non_pousses']:<3} modifs={i['dirty']:<3} {i['dernier_msg'][:50]}")
+    return "\n".join(L)
+
+
+def main():
+    mode = sys.argv[1] if len(sys.argv) > 1 else "texte"
+    if mode == "serve":
+        port = int(sys.argv[2]) if len(sys.argv) > 2 else 8765
+        srv = ThreadingHTTPServer(("127.0.0.1", port), Handler)
+        _CACHE["req"] = time.time()
+        threading.Thread(target=cache_loop, daemon=True).start()
+        print(f"agent-view : http://127.0.0.1:{port}  (Ctrl-C pour arrêter)")
+        try:
+            srv.serve_forever()
+        except KeyboardInterrupt:
+            pass
+    elif mode == "live":
+        every = int(sys.argv[2]) if len(sys.argv) > 2 else 2
+        while True:
+            print("\033[2J\033[H" + render_text(collect()), flush=True)
+            try:
+                time.sleep(every)
+            except KeyboardInterrupt:
+                print()
+                return
+    elif mode == "couts":
+        print(render_costs(collect_costs()))
+    elif mode == "conso":
+        if binaire_burn():
+            print("agent-view : calcul agent-burn en cours (peut prendre une minute sur un gros historique)…", file=sys.stderr)
+        CONSO.get(attendre=True)
+        QUOTAS.get(attendre=True)
+        print(render_conso(api_conso()))
+    elif mode == "liens":
+        print(render_liens(collect_liens()))
+    elif mode == "worktrees":
+        print(render_worktrees(collect_worktrees(), tout="--tout" in sys.argv))
+    else:
+        print(render_text(collect()))
+
+
+if __name__ == "__main__":
+    main()
