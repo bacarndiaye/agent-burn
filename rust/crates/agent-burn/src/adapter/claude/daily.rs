@@ -30,7 +30,7 @@ pub(super) fn load_daily_summaries_inner(
     group_by_project: bool,
 ) -> Result<Vec<UsageSummary>> {
     let paths = claude_paths()?;
-    let files = usage_files(&paths, project_filter);
+    let files = super::prune_files_before_since(usage_files(&paths, project_filter), shared);
     if files.is_empty() {
         return Ok(Vec::new());
     }
