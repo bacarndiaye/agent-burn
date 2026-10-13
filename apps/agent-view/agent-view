@@ -93,6 +93,7 @@ CONF = charger_conf()
 PIECES = [tuple(p) for p in CONF["pieces"]]
 ACTION_S = 90        # activité < 90 s = en action
 ATTENTE_MODELE_S = int(os.environ.get("AV_ATTENTE_MODELE_S", "900"))   # attend la réponse du modèle : en action jusqu'à 15 min
+OUTIL_MAX_S = int(os.environ.get("AV_OUTIL_MAX_S", "14400"))   # outil lancé sans résultat (go test, attente Docker…) : en action jusqu'à 4 h
 CPU_ACTIF = float(os.environ.get("AV_CPU_ACTIF", "0.15"))   # arbre de l'agent à ≥ 15 % d'un cœur entre 2 collectes = en action
 JUNIOR = {h for h in os.environ.get("AV_JUNIOR", "local,strata").split(",") if h}   # moteurs légers = « dev junior »
 AVATAR = {"sup": "🧑‍💼", "dev": "🧑‍💻", "mgr": "🧑‍✈️"}
@@ -159,10 +160,14 @@ def newest_mtime(paths, limit=12, needle=None):
 
 
 def attend_modele(f, n=65536):
-    """Vrai si le dernier événement du transcript est une ENTRÉE envoyée au modèle (résultat d'outil, message, début de
-    tour) : l'agent attend sa réponse. Un modèle local peut se taire plusieurs minutes (longue réponse, file d'attente)
-    sans que l'agent n'écrive ni ne consomme de CPU. Claude Code : dernière entrée « user ». Codex : dernier événement
-    function_call_output / message user / turn_context / task_started."""
+    """Ce qu'attend l'agent d'après le dernier événement de son transcript :
+    - « modele » : une ENTRÉE a été envoyée au modèle (résultat d'outil, message, début de tour) et il n'a pas répondu.
+      Un modèle local peut se taire plusieurs minutes (longue réponse, file d'attente) sans écriture ni CPU.
+    - « outil » : le modèle a lancé un outil dont le résultat n'est pas revenu (go test, boucle d'attente sur Docker…),
+      qui peut durer longtemps sans écrire dans le transcript ni consommer de CPU.
+    - None : tour terminé, l'agent attend une consigne (veille).
+    Claude Code : « user » = modele ; « assistant » avec un tool_use = outil. Codex : function_call = outil ;
+    task_complete / turn_aborted = fin de tour ; le reste d'un tour en cours = modele."""
     try:
         with open(f, "rb") as fh:
             try:
@@ -178,17 +183,23 @@ def attend_modele(f, n=65536):
         except ValueError:
             continue
         t = o.get("type")
-        if t in ("user", "assistant"):                         # Claude Code
-            return t == "user"
+        if t == "user":                                        # Claude Code
+            return "modele"
+        if t == "assistant":
+            contenu = (o.get("message") or {}).get("content")
+            if isinstance(contenu, list) and any(isinstance(c, dict) and c.get("type") == "tool_use" for c in contenu):
+                return "outil"
+            return None
         p = o.get("payload") or {}
         pt = p.get("type")
-        if t == "turn_context" or pt == "task_started" or pt in ("function_call_output", "custom_tool_call_output") \
-                or (pt == "message" and p.get("role") == "user"):
-            return True
-        if pt in ("function_call", "custom_tool_call", "reasoning", "task_complete", "turn_aborted") \
-                or (pt == "message" and p.get("role") == "assistant"):
-            return False
-    return False
+        if pt in ("function_call", "custom_tool_call"):        # Codex
+            return "outil"
+        if pt in ("task_complete", "turn_aborted"):
+            return None
+        if t == "turn_context" or pt in ("task_started", "function_call_output", "custom_tool_call_output", "reasoning") \
+                or (pt == "message" and p.get("role") in ("user", "assistant")):
+            return "modele"
+    return None
 
 
 def _tete_queue(f, n=65536):
@@ -486,6 +497,27 @@ def hors_bus(procs, regs):
     return out
 
 
+def adopter_reprises(procs, regs, vivants):
+    """Superviseur mort puis relancé à la main (`claude --resume <session>`, typiquement après un redémarrage de WSL) :
+    le nouveau processus n'a plus d'AGENT_ID ni d'inscription, l'ancienne inscription paraît « fini » et le travail en
+    cours n'est affiché nulle part. On rattache le processus vivant dont la session est celle que sup-failover avait
+    notée pour l'inscription morte. Renvoie {id: processus adopté}."""
+    pris = {int(r["pid"]) for r in regs if vivants.get(r["__id"]) and str(r.get("pid", "")).isdigit()}
+    libres = {d["sid"]: d for d in procs.values()
+              if d.get("sid") and d["pid"] not in pris and not (pris & set(d["ppids"]))}
+    out = {}
+    if not libres:
+        return out
+    for r in regs:
+        if vivants.get(r["__id"]) or r.get("role") != "sup" or not str(r.get("pid", "")).isdigit():
+            continue
+        tp = sup_transcript(r["pid"])
+        d = libres.get(Path(tp).stem) if tp else None
+        if d and d["pid"] not in {x["pid"] for x in out.values()}:
+            out[r["__id"]] = d
+    return out
+
+
 def creneaux():
     """{moteur: {total, pris, libres}} : verrous flock tenus par les dev-agent. /proc/locks ne montre pas les verrous
     dont le détenteur est hors de l'espace de noms (pid 0) : on lit les fdinfo des seuls dev-agent, sans rien verrouiller.
@@ -542,6 +574,12 @@ def collect():
     regs += hors_bus(procs, regs)
     # cwd partagés par plusieurs vivants → activité désambiguïsée par l'id dans le transcript
     vivants = {r["__id"]: reg_alive(r) for r in regs}
+    adoptes = adopter_reprises(procs, regs, vivants)
+    for i, r in enumerate(regs):
+        if r["__id"] in adoptes:
+            d = adoptes[r["__id"]]
+            regs[i] = {**{k: v for k, v in r.items() if k not in START_KEYS}, "pid": str(d["pid"]), "__adopte": d}
+            vivants[r["__id"]] = True
     partage = {}
     for reg in regs:
         if vivants[reg["__id"]]:
@@ -560,7 +598,11 @@ def collect():
             propre = Path(tp) if tp else jsonl_de(procs, f_id, pid)
             if propre is not None:
                 act = newest_mtime([propre])
-                attente = now - act < ATTENTE_MODELE_S and attend_modele(propre)
+                occupe = attend_modele(propre)
+                attente = (occupe == "modele" and now - act < ATTENTE_MODELE_S) or (occupe == "outil" and now - act < OUTIL_MAX_S)
+                sous = propre.with_suffix("") / "subagents"        # sous-agents internes (relecteurs…) : leur activité compte
+                if sous.is_dir():
+                    act = max(act, newest_mtime([sous]))
             else:
                 td = transcript_dir(wt)
                 needle = f_id if partage.get(str(td), 0) > 1 else None
@@ -577,9 +619,13 @@ def collect():
         else:
             state = "fini"
         decl = reg.get("harness", "?")
-        harness = (moteur_reel(procs, f_id, pid) or decl) if is_alive and not reg.get("__hors_bus") else decl
+        if reg.get("__adopte"):
+            harness = reg["__adopte"]["moteur"]          # relancé à la main : son moteur réel, plus celui de l'inscription
+        else:
+            harness = (moteur_reel(procs, f_id, pid) or decl) if is_alive and not reg.get("__hors_bus") else decl
         agents.append({
             "id": f_id, "role": reg.get("role", "?"), "harness": harness, "harness_declare": decl, "hors_bus": bool(reg.get("__hors_bus")),
+            "repris": bool(reg.get("__adopte")),
             "worktree": wt, "parent": reg.get("parent", ""), "pid": int(pid) if pid.isdigit() else 0,
             "classe": "mgr" if reg.get("role") == "mgr" else "sup" if reg.get("role") == "sup" else "junior" if harness in JUNIOR else "dev",
             "since": reg.get("since", ""), "alive": is_alive, "state": state,
