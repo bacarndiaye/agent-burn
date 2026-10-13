@@ -353,12 +353,16 @@ def processus_agents():
             if k in (b"AGENT_ID", b"ANTHROPIC_BASE_URL", b"ANTHROPIC_MODEL"):
                 env[k.decode()] = v.decode("utf8", "replace")
         cmd = " ".join(argv)
-        m = _moteur_url(env.get("ANTHROPIC_BASE_URL"), env.get("ANTHROPIC_MODEL"))
+        est_codex = any("codex" in x for x in tete)
+        # Codex ne lit pas ANTHROPIC_* : un développeur Codex en hérite de son superviseur (GLM, Strata…) et serait rangé
+        # dans la mauvaise salle. Pour lui, seul le fournisseur de sa ligne de commande compte.
+        m = None if est_codex else _moteur_url(env.get("ANTHROPIC_BASE_URL"), env.get("ANTHROPIC_MODEL"))
         if m is None:
-            m = moteur_cmd(cmd) or ("codex" if any("codex" in x for x in tete) else "claude")
+            m = moteur_cmd(cmd) or ("codex" if est_codex else "claude")
+        declare = bool(moteur_cmd(cmd)) or (not est_codex and bool(env.get("ANTHROPIC_BASE_URL")))
         procs[p] = {"pid": p, "ppid": tous[p], "cwd": cwd, "start": t, "agent_id": env.get("AGENT_ID", ""),
-                    "moteur": m, "declare": bool(env.get("ANTHROPIC_BASE_URL")) or bool(moteur_cmd(cmd)), "cmd": cmd[:160],
-                    "sid": session_de(argv), "rollouts": rollouts_ouverts(p) if m == "codex" else []}
+                    "moteur": m, "declare": declare, "cmd": cmd[:160],
+                    "sid": session_de(argv), "rollouts": rollouts_ouverts(p) if est_codex else []}
     for p, d in procs.items():
         d["ppids"] = []                       # ascendance (pid vers la racine), pour rattacher un processus à un agent enregistré
         q, n = d["ppid"], 0
