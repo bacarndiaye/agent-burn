@@ -16,6 +16,9 @@ reste de ce README est celui d'amont ; l'application macOS n'est pas modifiée.
   par jour par classe *gratuit* / *abonnement* / *payant*, part gratuite des tokens et coût évité, top modèles,
   valeur des abonnements, limites 5 h / 7 j avec l'heure de remise à zéro. agent-burn tourne en arrière-plan avec
   un cache : la page n'attend jamais.
+- **Débit et contexte par modèle** (même page, commande `agent-view debit`) : tokens/s effectifs (moyenne et
+  médiane), durée moyenne d'un appel, contexte moyen et pic moyen par session, sur les 7 derniers jours de journaux
+  Claude Code et Codex (`AV_DEBIT_JOURS`).
 - **Modèles locaux comptés à 0** : `pricingOverrides` de [`config/agent-burn.json`](config/agent-burn.json).
 - **`summary --json --breakdown`** ajoute `dailyModels`, la matrice jour × modèle déjà calculée pour le rapport
   HTML, pour empiler un jour par modèle sans relancer une commande par jour.

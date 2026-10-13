@@ -11,6 +11,7 @@ dépendance. La page « Conso & quotas » est alimentée par `agent-burn` (ce d�
 | `agent-view` | tableau terminal, une fois : agents en action / en veille / finis, flux des messages |
 | `agent-view live [s]` | même tableau rafraîchi toutes les `s` secondes (2 par défaut) |
 | `agent-view serve [port]` | vue web sur `127.0.0.1:<port>` (8765 par défaut) : bureaux en 3D ou 2D, communications, fils |
+| `agent-view debit` | tokens/s et contexte moyen par session, par modèle (voir ci-dessous) |
 | `agent-view conso` | consommation et quotas d'après agent-burn (voir ci-dessous) |
 | `agent-view couts` | tokens produits par les moteurs locaux / GLM, valorisés au tarif Opus |
 | `agent-view liens` | qui dirige qui, qui attend qui, messages perdus |
@@ -37,6 +38,14 @@ page affiche toujours la dernière donnée et son âge, jamais une attente :
   valorisés au prix moyen du token payant de la période — une estimation, pas une facture) ;
 - top modèles, valeur des abonnements (formule détectée, valeur mensuelle estimée) ;
 - limites 5 h et 7 j (Claude) et fenêtre Codex, avec l'heure de remise à zéro. Le quota GLM n'est pas exposé.
+- **débit et contexte par modèle** (lus directement dans les journaux, sans agent-burn, 7 derniers jours ;
+  `AV_DEBIT_JOURS` pour changer) : appels, **tokens/s effectifs** = tokens générés ÷ durée de l'appel, du dernier
+  message ou résultat d'outil reçu à la fin du dernier bloc de la réponse — préremplissage du prompt et attente d'un
+  créneau compris, donc la vitesse vécue par l'agent et non le décodage pur du serveur ; médiane ; durée moyenne d'un
+  appel ; **contexte moyen** (moyenne, par session, des tokens d'entrée de chaque appel, cache compris) et **pic
+  moyen** (contexte maximal atteint par session). Session = un transcript Claude Code (sous-agents compris) ou un
+  rollout Codex ; un appel de plus de 15 min est écarté du débit. Premier calcul ~20 s, puis seuls les fichiers
+  modifiés sont relus.
 
 Classes : un modèle est **gratuit** s'il est rattaché à un moteur local (`local` ou `strata`) dans la table
 `modeles` de la configuration ; sinon il est classé par préfixe (`classes`). Les modèles locaux sont comptés à 0 $

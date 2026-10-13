@@ -4,6 +4,7 @@
     agent-view                tableau terminal une fois (états + flux des messages)
     agent-view live [sec]     boucle terminal rafraîchie (défaut 2 s ; Ctrl-C pour sortir)
     agent-view couts          tokens générés par les moteurs locaux / GLM et équivalent Opus en $ / €
+    agent-view debit          tokens/s effectifs et contexte moyen par session, par modèle (journaux des 7 derniers jours)
     agent-view conso          consommation et quotas (agent-burn) : coût par jour gratuit / abonnement / payant,
                               part gratuite, top modèles, valeur des abonnements, limites 5 h / 7 j
     agent-view worktrees [--tout]   worktrees jamais poussés / en retard / modifiés (--tout : aussi les à jour)
@@ -2484,8 +2485,168 @@ CONSO = CacheFond(collect_conso, 600)
 QUOTAS = CacheFond(collect_quotas, 120)
 
 
+# ------------------------------------------- débit (tokens/s) et contexte par modèle : journaux locaux --
+# Débit EFFECTIF d'un appel = tokens générés / (fin du dernier bloc de la réponse − dernière entrée qui l'a précédée :
+# message, résultat d'outil). Il comprend donc le préremplissage du prompt et l'attente d'un créneau : c'est la vitesse
+# vécue par l'agent, pas la vitesse de décodage pure du serveur. Contexte d'un appel = tokens d'entrée, cache compris.
+# Session = un transcript (Claude Code, sous-agents compris) ou un rollout Codex.
+
+DEBIT_JOURS = float(os.environ.get("AV_DEBIT_JOURS", "7"))
+DEBIT_MAX_S = 900                       # appel plus long : session suspendue ou figée, écarté du débit
+_TS = re.compile(r'"timestamp":"([^"]+)"')
+_FICHIERS_DEBIT = {}                    # chemin -> (mtime_ns, taille, [(modèle, t, sortie, durée, contexte, fenêtre)])
+
+
+def _epoch(s):
+    try:
+        return datetime.fromisoformat(s.replace("Z", "+00:00")).timestamp()
+    except (AttributeError, ValueError):
+        return None
+
+
+def _ts_ligne(l):
+    m = _TS.search(l, max(0, len(l) - 400)) or _TS.search(l)
+    return _epoch(m.group(1)) if m else None
+
+
+def _appels_claude(path):
+    """Un transcript Claude Code : une réponse (message.id) peut s'étaler sur plusieurs lignes, une par bloc,
+    entrecoupées des résultats d'outils lancés pendant qu'elle s'écrit."""
+    out, avant, cur = [], None, None
+    def fin():
+        if cur and cur[1] and cur[2] and cur[2] > cur[1]:
+            out.append((cur[0], cur[2], cur[3], cur[2] - cur[1], cur[4], None))
+    with open(path, encoding="utf8", errors="replace") as f:
+        for l in f:
+            if '"type":"assistant"' not in l:
+                if '"type":"user"' in l or '"type":"attachment"' in l:
+                    avant = _ts_ligne(l) or avant
+                continue
+            try:
+                o = json.loads(l)
+            except ValueError:
+                continue
+            if o.get("type") != "assistant":
+                avant = _epoch(o.get("timestamp", "")) or avant
+                continue
+            m = o.get("message") or {}
+            u, t = m.get("usage") or {}, _epoch(o.get("timestamp", ""))
+            if cur and cur[5] == m.get("id"):
+                cur[2], cur[3] = t or cur[2], max(cur[3], u.get("output_tokens") or 0)
+                continue
+            fin()
+            ctx = (u.get("input_tokens") or 0) + (u.get("cache_creation_input_tokens") or 0) + (u.get("cache_read_input_tokens") or 0)
+            cur = [m.get("model"), avant, t, u.get("output_tokens") or 0, ctx, m.get("id")]
+    fin()
+    return [a for a in out if a[0] and a[0] != "<synthetic>"]
+
+
+def _appels_codex(path):
+    """Un rollout Codex : token_usage_record = une réponse ; son début = dernière entrée reçue par le modèle."""
+    out, avant, modele, fenetre = [], None, None, None
+    with open(path, encoding="utf8", errors="replace") as f:
+        for l in f:
+            if '"turn_context"' in l[:120] or '"task_started"' in l or '"function_call_output"' in l \
+                    or '"custom_tool_call_output"' in l or ('"role":"user"' in l and '"response_item"' in l[:120]):
+                try:
+                    o = json.loads(l)
+                except ValueError:
+                    continue
+                ty, pl = o.get("type"), o.get("payload") or {}
+                if ty == "turn_context":
+                    modele = pl.get("model") or modele
+                elif not (pl.get("type") == "task_started" or pl.get("type") in ("function_call_output", "custom_tool_call_output")
+                          or (pl.get("type") == "message" and pl.get("role") == "user")):
+                    continue                     # la chaîne apparaissait dans un autre contenu
+                avant = _epoch(o.get("timestamp", "")) or avant
+            elif fenetre is None and '"model_context_window"' in l:
+                m = re.search(r'"model_context_window":(\d+)', l)
+                fenetre = int(m.group(1)) if m else None
+            elif '"token_usage_record"' in l[:120]:
+                try:
+                    o = json.loads(l)
+                except ValueError:
+                    continue
+                u, t = (o.get("payload") or {}).get("usage") or {}, _epoch(o.get("timestamp", ""))
+                if modele and t:
+                    out.append((modele, t, u.get("output_tokens") or 0, t - avant if avant and t > avant else None,
+                                u.get("input_tokens") or 0, None))
+                avant = t or avant
+    return [a[:5] + (fenetre,) for a in out]
+
+
+def _fichiers_recents(racine, motif, depuis):
+    if not racine.is_dir():
+        return
+    for p in racine.glob(motif):
+        try:
+            st = p.stat()
+        except OSError:
+            continue
+        if st.st_mtime >= depuis:
+            yield p, st
+
+
+def collect_debit():
+    depuis = time.time() - DEBIT_JOURS * 86400
+    vus, mod = set(), {}
+    sources = [(_fichiers_recents(CLAUDE_PROJ, "**/*.jsonl", depuis), _appels_claude, "claude"),
+               (_fichiers_recents(CODEX_SESSIONS, "*/*/*/rollout-*.jsonl", depuis), _appels_codex, "codex")]
+    for fichiers, lire_f, outil in sources:
+        for p, st in fichiers:
+            k = str(p)
+            vus.add(k)
+            c = _FICHIERS_DEBIT.get(k)
+            if not c or c[0] != st.st_mtime_ns or c[1] != st.st_size:
+                try:
+                    c = (st.st_mtime_ns, st.st_size, lire_f(p))
+                except OSError:
+                    continue
+                _FICHIERS_DEBIT[k] = c
+            par_modele = {}
+            for modele, t, sortie, duree, ctx, fen in c[2]:
+                if t < depuis:
+                    continue
+                e = mod.setdefault(modele, {"modele": modele, "outils": set(), "appels": 0, "mesures": 0, "sortie": 0,
+                                            "duree": 0.0, "vitesses": [], "sessions": [], "fenetre": fen})
+                e["outils"].add(outil)
+                e["fenetre"] = e["fenetre"] or fen
+                e["appels"] += 1
+                if duree and 0.05 < duree <= DEBIT_MAX_S and sortie > 0:
+                    e["mesures"] += 1
+                    e["sortie"] += sortie
+                    e["duree"] += duree
+                    e["vitesses"].append(sortie / duree)
+                if ctx:
+                    par_modele.setdefault(modele, []).append(ctx)
+            for modele, cs in par_modele.items():
+                mod[modele]["sessions"].append((sum(cs) / len(cs), max(cs)))
+    for k in [k for k in _FICHIERS_DEBIT if k not in vus]:       # fichiers sortis de la fenêtre : oubliés
+        del _FICHIERS_DEBIT[k]
+    lignes = []
+    for e in mod.values():
+        s, v = e.pop("sessions"), e.pop("vitesses")
+        e.update(sessions=len(s),
+                 tok_s=round(e["sortie"] / e["duree"], 1) if e["duree"] else None,
+                 tok_s_median=round(statistics.median(v), 1) if v else None,
+                 duree_moy=round(e["duree"] / e["mesures"], 1) if e["mesures"] else None,
+                 sortie_moy=round(e["sortie"] / e["mesures"]) if e["mesures"] else None,
+                 ctx_moy=round(sum(x[0] for x in s) / len(s)) if s else None,
+                 ctx_pic=round(sum(x[1] for x in s) / len(s)) if s else None,
+                 moteur=moteur_de_modele(e["modele"]), classe=classe_modele(e["modele"]))
+        e["duree"], e["outils"] = round(e["duree"]), sorted(e["outils"])
+        if e["outils"] != ["codex"]:
+            e["fenetre"] = None              # fenêtre lue dans les rollouts Codex : fausse pour les sessions Claude Code
+        lignes.append(e)
+    lignes.sort(key=lambda x: -x["appels"])
+    return {"jours": DEBIT_JOURS, "modeles": lignes}
+
+
+DEBIT = CacheFond(collect_debit, 600)
+
+
 def api_conso():
-    return {"binaire": bool(binaire_burn()), "conso": CONSO.get(), "quotas": QUOTAS.get(),
+    return {"binaire": bool(binaire_burn()), "conso": CONSO.get(), "quotas": QUOTAS.get(), "debit": DEBIT.get(),
             "eur_par_usd": EUR_PAR_USD, "maintenant_ms": int(time.time() * 1000)}
 
 
@@ -2498,6 +2659,26 @@ def resume_burn():
     return {"part": c["part_gratuite"], "payant_7j_usd": round(sum(j["cout"]["payant"] for j in j7), 2),
             "abonnement_7j_usd": round(sum(j["cout"]["abonnement"] for j in j7), 2), "evite_usd": c["evite_usd"],
             "periode": c["periode"]}
+
+
+def render_debit(api):
+    B, D, R = "\033[1m", "\033[2m", "\033[0m"
+    c = api["debit"]
+    if c["erreur"] and not c["data"]:
+        return f"{B}DÉBIT & CONTEXTE{R} : indisponible : {c['erreur']}"
+    d = c["data"]
+    if not d:
+        return f"{B}DÉBIT & CONTEXTE{R} : calcul en cours…"
+    k = lambda n: "—" if n is None else f"{n / 1000:.0f} k"
+    f = lambda n: "—" if n is None else f"{n:.1f}"
+    L = [f"{B}DÉBIT & CONTEXTE PAR MODÈLE{R} {D}({d['jours']:g} derniers jours, journaux Claude Code et Codex){R}",
+         f"  {'modèle':<28}{'moteur':<8}{'appels':>8}{'tok/s':>8}{'médiane':>9}{'s/appel':>9}{'sessions':>10}{'ctx moyen':>11}{'ctx pic':>9}"]
+    for e in d["modeles"]:
+        L.append(f"  {e['modele'][:27]:<28}{(e['moteur'] or e['classe'])[:7]:<8}{e['appels']:>8}{f(e['tok_s']):>8}{f(e['tok_s_median']):>9}"
+                 f"{f(e['duree_moy']):>9}{e['sessions']:>10}{k(e['ctx_moy']):>11}{k(e['ctx_pic']):>9}")
+    L.append(f"  {D}tok/s = débit EFFECTIF (tokens générés / durée de l'appel, préremplissage et attente compris) ;{R}")
+    L.append(f"  {D}ctx moyen = moyenne par session du contexte de chaque appel ; ctx pic = contexte maximal d'une session, en moyenne{R}")
+    return "\n".join(L)
 
 
 def render_conso(api):
@@ -2575,6 +2756,7 @@ footer{grid-column:1/-1;color:var(--dim);font-size:12px;line-height:1.6}
  <div class="panel"><h2>Limites d'abonnement</h2><div id="quotas"></div></div>
  <div class="panel"><h2>Abonnements</h2><div id="abos"></div></div>
  <div class="panel large"><h2>Top modèles</h2><div id="top"></div></div>
+ <div class="panel large"><h2 id="tdeb">Débit et contexte par modèle</h2><div id="debit"></div></div>
  <footer id="pied"></footer>
 </main>
 <script>
@@ -2618,7 +2800,20 @@ function render(A){const C=A.conso,D=C.data,Q=(A.quotas.data||{}),k=A.eur_par_us
  $("pied").innerHTML=`Source : <b>agent-burn</b> (journaux locaux ; coût = équivalent API, pas une facture). Classes : <b>gratuit</b> = modèles servis par un moteur local (table « modeles » de la configuration),
   <b>abonnement</b> / <b>payant</b> = préfixes de modèle (« classes »). Les modèles locaux sont comptés à 0 par les <code>pricingOverrides</code> d'agent-burn.
   Limites : rafraîchies toutes les 2 min ; consommation : toutes les 10 min.`+(errs.length?`<div class="err">${errs.map(esc).join(" · ")}</div>`:"")}
-async function charger(){try{const r=await fetch("/api/conso");render(await r.json())}catch(e){$("maj").textContent="serveur injoignable"}}
+function renderDebit(B){const D=B&&B.data;
+ if(!D){$("debit").innerHTML=`<div class="vide">${B&&B.erreur?`<span class="err">indisponible : ${esc(B.erreur)}</span>`:"Calcul en cours (une vingtaine de secondes au premier passage)…"}</div>`;return}
+ $("tdeb").textContent=`Débit et contexte par modèle · ${D.jours} derniers jours`;
+ const n1=n=>n==null?"—":Number(n).toFixed(1).replace(".",","),kt=n=>n==null?"—":Math.round(n/1000)+" k";
+ const mx=Math.max(1,...D.modeles.map(e=>e.tok_s||0)),col=e=>e.classe==="gratuit"?"var(--ok)":e.classe==="abonnement"?"var(--warn)":e.classe==="payant"?"#ec4899":"var(--dim)";
+ $("debit").innerHTML=`<div style="overflow-x:auto"><table><thead><tr><th>Modèle</th><th>Moteur</th><th class="num">Appels</th><th style="width:22%">Tokens/s (débit effectif)</th><th class="num">Médiane</th>
+  <th class="num">s / appel</th><th class="num">Sessions</th><th class="num">Contexte moyen</th><th class="num">Pic moyen</th></tr></thead><tbody>`+
+  D.modeles.map(e=>{const w=e.tok_s?Math.max(2,e.tok_s/mx*100):0,fen=e.fenetre?` <span class="dim">/ ${kt(e.fenetre)}</span>`:"";
+   return `<tr><td>${esc(e.modele)} <span class="dim">${esc(e.outils.join(", "))}</span></td><td><span class="chip" style="--c:${col(e)}">${esc(e.moteur||e.classe)}</span></td>
+   <td class="num">${e.appels.toLocaleString("fr-FR")}</td><td><div class="q" style="margin:0"><div class="l"><b>${n1(e.tok_s)}</b></div><div class="t"><div class="u" style="width:${w}%;background:${col(e)}"></div></div></div></td>
+   <td class="num">${n1(e.tok_s_median)}</td><td class="num">${n1(e.duree_moy)}</td><td class="num">${e.sessions}</td><td class="num">${kt(e.ctx_moy)}${fen}</td><td class="num">${kt(e.ctx_pic)}</td></tr>`}).join("")+
+  `</tbody></table></div><div class="leg"><span><b>Tokens/s</b> = tokens générés ÷ durée de l'appel (préremplissage du prompt et attente d'un créneau compris : vitesse vécue par l'agent, pas le décodage pur du serveur).</span>
+  <span><b>Contexte moyen</b> = moyenne, par session, du contexte de chaque appel (entrée + cache) ; <b>pic moyen</b> = contexte maximal atteint par session, en moyenne. Session = un transcript ou un rollout.</span></div>`}
+async function charger(){try{const r=await fetch("/api/conso");const A=await r.json();render(A);renderDebit(A.debit)}catch(e){$("maj").textContent="serveur injoignable"}}
 charger();setInterval(charger,15000);
 </script></body></html>
 """
@@ -2774,6 +2969,9 @@ def main():
         CONSO.get(attendre=True)
         QUOTAS.get(attendre=True)
         print(render_conso(api_conso()))
+    elif mode == "debit":
+        DEBIT.get(attendre=True)
+        print(render_debit(api_conso()))
     elif mode == "liens":
         print(render_liens(collect_liens()))
     elif mode == "worktrees":
