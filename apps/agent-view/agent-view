@@ -92,6 +92,7 @@ def charger_conf():
 CONF = charger_conf()
 PIECES = [tuple(p) for p in CONF["pieces"]]
 ACTION_S = 90        # activité < 90 s = en action
+ATTENTE_MODELE_S = int(os.environ.get("AV_ATTENTE_MODELE_S", "900"))   # attend la réponse du modèle : en action jusqu'à 15 min
 CPU_ACTIF = float(os.environ.get("AV_CPU_ACTIF", "0.15"))   # arbre de l'agent à ≥ 15 % d'un cœur entre 2 collectes = en action
 JUNIOR = {h for h in os.environ.get("AV_JUNIOR", "local,strata").split(",") if h}   # moteurs légers = « dev junior »
 AVATAR = {"sup": "🧑‍💼", "dev": "🧑‍💻", "mgr": "🧑‍✈️"}
@@ -155,6 +156,39 @@ def newest_mtime(paths, limit=12, needle=None):
         except OSError:
             pass
     return best
+
+
+def attend_modele(f, n=65536):
+    """Vrai si le dernier événement du transcript est une ENTRÉE envoyée au modèle (résultat d'outil, message, début de
+    tour) : l'agent attend sa réponse. Un modèle local peut se taire plusieurs minutes (longue réponse, file d'attente)
+    sans que l'agent n'écrive ni ne consomme de CPU. Claude Code : dernière entrée « user ». Codex : dernier événement
+    function_call_output / message user / turn_context / task_started."""
+    try:
+        with open(f, "rb") as fh:
+            try:
+                fh.seek(-n, os.SEEK_END)
+            except OSError:
+                pass
+            lignes = fh.read().decode("utf8", "replace").splitlines()
+    except OSError:
+        return False
+    for l in reversed(lignes[1:] if len(lignes) > 1 else lignes):
+        try:
+            o = json.loads(l)
+        except ValueError:
+            continue
+        t = o.get("type")
+        if t in ("user", "assistant"):                         # Claude Code
+            return t == "user"
+        p = o.get("payload") or {}
+        pt = p.get("type")
+        if t == "turn_context" or pt == "task_started" or pt in ("function_call_output", "custom_tool_call_output") \
+                or (pt == "message" and p.get("role") == "user"):
+            return True
+        if pt in ("function_call", "custom_tool_call", "reasoning", "task_complete", "turn_aborted") \
+                or (pt == "message" and p.get("role") == "assistant"):
+            return False
+    return False
 
 
 def _tete_queue(f, n=65536):
@@ -520,12 +554,13 @@ def collect():
         pid = reg.get("pid", "")
         wt = reg.get("worktree", "")
         is_alive = vivants[f_id]
-        act, cpu_actif = 0.0, False
+        act, cpu_actif, attente = 0.0, False, False
         if is_alive:                       # un agent fini n'est plus observé : aucune lecture de transcript
             tp = sup_transcript(pid)
             propre = Path(tp) if tp else jsonl_de(procs, f_id, pid)
             if propre is not None:
                 act = newest_mtime([propre])
+                attente = now - act < ATTENTE_MODELE_S and attend_modele(propre)
             else:
                 td = transcript_dir(wt)
                 needle = f_id if partage.get(str(td), 0) > 1 else None
@@ -535,7 +570,7 @@ def collect():
                 if t_prev and now > t_prev:
                     cpu_actif = (cpu[int(pid)] - c_prev) / CLK / (now - t_prev) >= CPU_ACTIF
                 _CPU_PREV[int(pid)] = (now, cpu[int(pid)])
-        if is_alive and (now - act < ACTION_S or cpu_actif or worktree_recent(wt)):
+        if is_alive and (now - act < ACTION_S or cpu_actif or attente or worktree_recent(wt)):
             state = "action"
         elif is_alive:
             state = "veille"
