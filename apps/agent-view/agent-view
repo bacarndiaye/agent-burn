@@ -92,6 +92,8 @@ def charger_conf():
 CONF = charger_conf()
 PIECES = [tuple(p) for p in CONF["pieces"]]
 ACTION_S = 90        # activité < 90 s = en action
+ATTENTE_MODELE_S = int(os.environ.get("AV_ATTENTE_MODELE_S", "900"))   # attend la réponse du modèle : en action jusqu'à 15 min
+OUTIL_MAX_S = int(os.environ.get("AV_OUTIL_MAX_S", "14400"))   # outil lancé sans résultat (go test, attente Docker…) : en action jusqu'à 4 h
 CPU_ACTIF = float(os.environ.get("AV_CPU_ACTIF", "0.15"))   # arbre de l'agent à ≥ 15 % d'un cœur entre 2 collectes = en action
 JUNIOR = {h for h in os.environ.get("AV_JUNIOR", "local,strata").split(",") if h}   # moteurs légers = « dev junior »
 AVATAR = {"sup": "🧑‍💼", "dev": "🧑‍💻", "mgr": "🧑‍✈️"}
@@ -155,6 +157,49 @@ def newest_mtime(paths, limit=12, needle=None):
         except OSError:
             pass
     return best
+
+
+def attend_modele(f, n=65536):
+    """Ce qu'attend l'agent d'après le dernier événement de son transcript :
+    - « modele » : une ENTRÉE a été envoyée au modèle (résultat d'outil, message, début de tour) et il n'a pas répondu.
+      Un modèle local peut se taire plusieurs minutes (longue réponse, file d'attente) sans écriture ni CPU.
+    - « outil » : le modèle a lancé un outil dont le résultat n'est pas revenu (go test, boucle d'attente sur Docker…),
+      qui peut durer longtemps sans écrire dans le transcript ni consommer de CPU.
+    - None : tour terminé, l'agent attend une consigne (veille).
+    Claude Code : « user » = modele ; « assistant » avec un tool_use = outil. Codex : function_call = outil ;
+    task_complete / turn_aborted = fin de tour ; le reste d'un tour en cours = modele."""
+    try:
+        with open(f, "rb") as fh:
+            try:
+                fh.seek(-n, os.SEEK_END)
+            except OSError:
+                pass
+            lignes = fh.read().decode("utf8", "replace").splitlines()
+    except OSError:
+        return False
+    for l in reversed(lignes[1:] if len(lignes) > 1 else lignes):
+        try:
+            o = json.loads(l)
+        except ValueError:
+            continue
+        t = o.get("type")
+        if t == "user":                                        # Claude Code
+            return "modele"
+        if t == "assistant":
+            contenu = (o.get("message") or {}).get("content")
+            if isinstance(contenu, list) and any(isinstance(c, dict) and c.get("type") == "tool_use" for c in contenu):
+                return "outil"
+            return None
+        p = o.get("payload") or {}
+        pt = p.get("type")
+        if pt in ("function_call", "custom_tool_call"):        # Codex
+            return "outil"
+        if pt in ("task_complete", "turn_aborted"):
+            return None
+        if t == "turn_context" or pt in ("task_started", "function_call_output", "custom_tool_call_output", "reasoning") \
+                or (pt == "message" and p.get("role") in ("user", "assistant")):
+            return "modele"
+    return None
 
 
 def _tete_queue(f, n=65536):
@@ -239,8 +284,8 @@ def reg_alive(reg):
 DEVLOCKS = HOME / ".cache" / "dev-agent"
 CRENEAUX = {      # moteur -> (préfixe du fichier verrou, nombre de créneaux) : mêmes valeurs que engine-check
     "glm": ("slot-glm-", int(os.environ.get("DEV_AGENT_GLM_SLOTS", "5"))),
-    "strata": ("slot-strata-", int(os.environ.get("DEV_AGENT_STRATA_SLOTS", "4"))),
-    "local": ("slot-", int(os.environ.get("DEV_AGENT_LOCAL_SLOTS", "1"))),
+    "strata": ("slot-strata-", int(os.environ.get("DEV_AGENT_STRATA_SLOTS", "1"))),
+    "local": ("slot-", int(os.environ.get("DEV_AGENT_LOCAL_SLOTS", "3"))),
 }
 CLES = CONF["fichiers_cles"]       # moteur -> fichier de clé qui l'active (configuration locale)
 DOSSIER_CLES = Path(os.path.expanduser(CONF["dossier_cles"])) if CONF["dossier_cles"] else None
@@ -353,12 +398,16 @@ def processus_agents():
             if k in (b"AGENT_ID", b"ANTHROPIC_BASE_URL", b"ANTHROPIC_MODEL"):
                 env[k.decode()] = v.decode("utf8", "replace")
         cmd = " ".join(argv)
-        m = _moteur_url(env.get("ANTHROPIC_BASE_URL"), env.get("ANTHROPIC_MODEL"))
+        est_codex = any("codex" in x for x in tete)
+        # Codex ne lit pas ANTHROPIC_* : un développeur Codex en hérite de son superviseur (GLM, Strata…) et serait rangé
+        # dans la mauvaise salle. Pour lui, seul le fournisseur de sa ligne de commande compte.
+        m = None if est_codex else _moteur_url(env.get("ANTHROPIC_BASE_URL"), env.get("ANTHROPIC_MODEL"))
         if m is None:
-            m = moteur_cmd(cmd) or ("codex" if any("codex" in x for x in tete) else "claude")
+            m = moteur_cmd(cmd) or ("codex" if est_codex else "claude")
+        declare = bool(moteur_cmd(cmd)) or (not est_codex and bool(env.get("ANTHROPIC_BASE_URL")))
         procs[p] = {"pid": p, "ppid": tous[p], "cwd": cwd, "start": t, "agent_id": env.get("AGENT_ID", ""),
-                    "moteur": m, "declare": bool(env.get("ANTHROPIC_BASE_URL")) or bool(moteur_cmd(cmd)), "cmd": cmd[:160],
-                    "sid": session_de(argv), "rollouts": rollouts_ouverts(p) if m == "codex" else []}
+                    "moteur": m, "declare": declare, "cmd": cmd[:160],
+                    "sid": session_de(argv), "rollouts": rollouts_ouverts(p) if est_codex else []}
     for p, d in procs.items():
         d["ppids"] = []                       # ascendance (pid vers la racine), pour rattacher un processus à un agent enregistré
         q, n = d["ppid"], 0
@@ -448,6 +497,27 @@ def hors_bus(procs, regs):
     return out
 
 
+def adopter_reprises(procs, regs, vivants):
+    """Superviseur mort puis relancé à la main (`claude --resume <session>`, typiquement après un redémarrage de WSL) :
+    le nouveau processus n'a plus d'AGENT_ID ni d'inscription, l'ancienne inscription paraît « fini » et le travail en
+    cours n'est affiché nulle part. On rattache le processus vivant dont la session est celle que sup-failover avait
+    notée pour l'inscription morte. Renvoie {id: processus adopté}."""
+    pris = {int(r["pid"]) for r in regs if vivants.get(r["__id"]) and str(r.get("pid", "")).isdigit()}
+    libres = {d["sid"]: d for d in procs.values()
+              if d.get("sid") and d["pid"] not in pris and not (pris & set(d["ppids"]))}
+    out = {}
+    if not libres:
+        return out
+    for r in regs:
+        if vivants.get(r["__id"]) or r.get("role") != "sup" or not str(r.get("pid", "")).isdigit():
+            continue
+        tp = sup_transcript(r["pid"])
+        d = libres.get(Path(tp).stem) if tp else None
+        if d and d["pid"] not in {x["pid"] for x in out.values()}:
+            out[r["__id"]] = d
+    return out
+
+
 def creneaux():
     """{moteur: {total, pris, libres}} : verrous flock tenus par les dev-agent. /proc/locks ne montre pas les verrous
     dont le détenteur est hors de l'espace de noms (pid 0) : on lit les fdinfo des seuls dev-agent, sans rien verrouiller.
@@ -504,6 +574,12 @@ def collect():
     regs += hors_bus(procs, regs)
     # cwd partagés par plusieurs vivants → activité désambiguïsée par l'id dans le transcript
     vivants = {r["__id"]: reg_alive(r) for r in regs}
+    adoptes = adopter_reprises(procs, regs, vivants)
+    for i, r in enumerate(regs):
+        if r["__id"] in adoptes:
+            d = adoptes[r["__id"]]
+            regs[i] = {**{k: v for k, v in r.items() if k not in START_KEYS}, "pid": str(d["pid"]), "__adopte": d}
+            vivants[r["__id"]] = True
     partage = {}
     for reg in regs:
         if vivants[reg["__id"]]:
@@ -516,12 +592,17 @@ def collect():
         pid = reg.get("pid", "")
         wt = reg.get("worktree", "")
         is_alive = vivants[f_id]
-        act, cpu_actif = 0.0, False
+        act, cpu_actif, attente = 0.0, False, False
         if is_alive:                       # un agent fini n'est plus observé : aucune lecture de transcript
             tp = sup_transcript(pid)
             propre = Path(tp) if tp else jsonl_de(procs, f_id, pid)
             if propre is not None:
                 act = newest_mtime([propre])
+                occupe = attend_modele(propre)
+                attente = (occupe == "modele" and now - act < ATTENTE_MODELE_S) or (occupe == "outil" and now - act < OUTIL_MAX_S)
+                sous = propre.with_suffix("") / "subagents"        # sous-agents internes (relecteurs…) : leur activité compte
+                if sous.is_dir():
+                    act = max(act, newest_mtime([sous]))
             else:
                 td = transcript_dir(wt)
                 needle = f_id if partage.get(str(td), 0) > 1 else None
@@ -531,16 +612,20 @@ def collect():
                 if t_prev and now > t_prev:
                     cpu_actif = (cpu[int(pid)] - c_prev) / CLK / (now - t_prev) >= CPU_ACTIF
                 _CPU_PREV[int(pid)] = (now, cpu[int(pid)])
-        if is_alive and (now - act < ACTION_S or cpu_actif or worktree_recent(wt)):
+        if is_alive and (now - act < ACTION_S or cpu_actif or attente or worktree_recent(wt)):
             state = "action"
         elif is_alive:
             state = "veille"
         else:
             state = "fini"
         decl = reg.get("harness", "?")
-        harness = (moteur_reel(procs, f_id, pid) or decl) if is_alive and not reg.get("__hors_bus") else decl
+        if reg.get("__adopte"):
+            harness = reg["__adopte"]["moteur"]          # relancé à la main : son moteur réel, plus celui de l'inscription
+        else:
+            harness = (moteur_reel(procs, f_id, pid) or decl) if is_alive and not reg.get("__hors_bus") else decl
         agents.append({
             "id": f_id, "role": reg.get("role", "?"), "harness": harness, "harness_declare": decl, "hors_bus": bool(reg.get("__hors_bus")),
+            "repris": bool(reg.get("__adopte")),
             "worktree": wt, "parent": reg.get("parent", ""), "pid": int(pid) if pid.isdigit() else 0,
             "classe": "mgr" if reg.get("role") == "mgr" else "sup" if reg.get("role") == "sup" else "junior" if harness in JUNIOR else "dev",
             "since": reg.get("since", ""), "alive": is_alive, "state": state,
