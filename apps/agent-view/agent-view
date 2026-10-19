@@ -285,7 +285,7 @@ DEVLOCKS = HOME / ".cache" / "dev-agent"
 CRENEAUX = {      # moteur -> (préfixe du fichier verrou, nombre de créneaux) : mêmes valeurs que engine-check
     "glm": ("slot-glm-", int(os.environ.get("DEV_AGENT_GLM_SLOTS", "5"))),
     "strata": ("slot-strata-", int(os.environ.get("DEV_AGENT_STRATA_SLOTS", "1"))),
-    "local": ("slot-", int(os.environ.get("DEV_AGENT_LOCAL_SLOTS", "1"))),
+    "local": ("slot-", int(os.environ.get("DEV_AGENT_LOCAL_SLOTS", "3"))),
 }
 CLES = CONF["fichiers_cles"]       # moteur -> fichier de clé qui l'active (configuration locale)
 DOSSIER_CLES = Path(os.path.expanduser(CONF["dossier_cles"])) if CONF["dossier_cles"] else None
